@@ -1,0 +1,9 @@
+# Host-side dependencies.
+#   pip install -r requirements.txt
+#
+# pyserial is required. matplotlib is only needed for plot_comparison.py and
+# blade_tone.py --plot; measure.py records CSV without it. numpy is needed only
+# by blade_tone.py.
+pyserial>=3.5
+matplotlib>=3.5
+numpy>=1.20
