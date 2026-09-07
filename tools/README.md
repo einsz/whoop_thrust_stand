@@ -24,6 +24,8 @@ They fall into four groups:
 | [`branch_probe.py`](#branch_probepy) | experiment | provoke and detect the half-speed branch, the open drive defect |
 | [`sweep_monotonic.py`](#sweep_monotonicpy) | analysis | flag sweeps where RPM falls as throttle rises, before their numbers get used |
 | [`patch_bluejay_debug.py`](#patch_bluejay_debugpy) | ESC | patch a released Bluejay hex to stream its internal commutation period |
+| [`am32.py`](#am32py) | ESC | read, change and flash an AM32 ESC over 4-Way, so its firmware and settings stop being a declared value |
+| [`flash_board.py`](#flash_boardpy) | ESC | swap the board between the stand firmware and the ESC passthrough in one command |
 
 ## Conventions
 
@@ -50,6 +52,13 @@ that commands zero throttle. If you write another tool here, keep both.
 
 ## Testing without hardware
 
+The emulator covers a protocol that runs to completion. The failure paths live
+in `tests/` at the repo root, which drives `measure.py` through an in-memory
+serial peer instead of a pty: a board that goes quiet, a firmware abort, a
+Ctrl-C partway through a mass check. Run them with
+`python -m unittest discover -s tests`. Neither is a firmware test; that is
+still hardware work.
+
 ### `fake_stand.py`
 
 A firmware emulator. It opens a pty, speaks telemetry schema 1, and runs the
@@ -66,7 +75,7 @@ host has to say so rather than quietly average the survivors. It carries
 ground-truth motor and load-cell models, so the Kv fit and the MASSCHECK fit can
 be checked against known values rather than eyeballed. The model also tracks
 `SPIN,<0|1>` and reverses the sign of the thrust it reports (at ~50% of
-forward magnitude, the ratio measured on the real bench; see BENCH_NOTES.md)
+forward magnitude, the ratio measured on the real bench)
 rather than leaving thrust positive regardless of commanded direction; without
 that, any host-side check comparing declared rotation against the load cell's
 sign (`measure.py`'s `check_rotation_sign`) would pass against the emulator no
@@ -91,7 +100,7 @@ supposed to notice and report:
 | `--tare-early` | taring mid-transient during a mass check; the fit should survive it |
 | `--no-edt` | an ESC that ignored the EDT enable command (pair with `-- --edt`) |
 | `--no-bmp` | the ambient sensor missing from the I²C bus |
-| `--no-rpm-lattice` | an ESC without the period quantisation real ones show |
+| `--no-rpm-lattice` | an ESC without the period quantisation Bluejay shows. Use it to model an AM32 ESC, which reports consecutive integer microseconds with no lattice at all |
 | `--period-bias LO,HI,PCT` | speed under-reported over one RPM band |
 | `--stale-rpm-every N` | flag every Nth printed row `rpm_stale`. The host must keep the step and record the count in `n_rpm_stale` rather than discarding it |
 | `--load-cell nau7802` | the other supported ADC in the `#SCALE` banner. Pair with `--thrust-sps 320` for the full NAU7802 case |
@@ -239,6 +248,10 @@ python tools/phase_probe.py --dshot 384 --log-ms 10000 --trigger-below 13500
 Captures are spaced through the window rather than all at once, so a one-off
 artefact is distinguishable from the steady waveform.
 
+**Filenames carry a UTC timestamp unless you pass `--tag`.** The fixed default
+silently overwrote a healthy baseline on 2026-09-06, and a trace of a fault that
+fades is not something you can go back and retake.
+
 **`--trigger-below N` waits for a state instead of sampling on a schedule.** Use
 it for anything the machine does briefly and unpredictably: a round fires on the
 first fresh telemetry frame below `N`, then re-arms, so several excursions in one
@@ -377,17 +390,28 @@ python tools/branch_probe.py                                   # th 20, 10 attem
 python tools/branch_probe.py --throttles 14,16,18,22 --attempts 3
 ```
 
-**Run it first, before anything else spins the motor.** Provocability fades
-within a session (4 of 8, then 1 of 10, then 0 of 12 across an hour with
-nothing changed), so a negative taken late says very little.
+**When to run it is an open question, so record the conditions.** On 2026-08-20
+provocability faded within a session: 4 of 8, then 1 of 10, then 0 of 12 across
+an hour with nothing changed. On 2026-09-06 it did the opposite, arriving after
+ninety minutes of sweeps and stall testing and gone fifteen minutes later. Each
+result now carries its own ESC temperature span so the two can eventually be
+compared; neither of those sessions recorded it, which is why they cannot be.
 
 It jumps to the setpoint from a standstill every time, and that is the point
 rather than an implementation detail: arriving by a 1% staircase from idle, or
 by stepping down from th 50, suppressed the fault entirely across 36 s.
 
+**A start that never happens is reported as `FAILED START`, not as a dip.** A
+motor crawling at a few hundred RPM would otherwise register excursions against
+its own median and the run would declare the fault live; that happened on
+2026-09-06 at `startup_power=50`. Anything whose upper branch is under 2,000 RPM
+is treated as a failed start.
+
 **A clean run of attempts is not a fix**, an error made twice on this bench.
-When the fault is live, take the two measurements that need it: a scope trace
-via `phase_probe.py` triggered below 13,500 RPM, and the old ~19 kKV motor swap.
+When the fault is live, take the two measurements that need it: the old ~19 kKV
+motor swap, and a scope trace via `phase_probe.py` triggered well below the
+upper branch the probe just reported. Trigger deep rather than close: about
+11,000 RPM when that branch sits near 15,000.
 
 ### `spindown_probe.py`
 
@@ -448,10 +472,8 @@ index-based scan silently compares the wrong two columns. On the sweeps taken
 2026-09-01 it finds 12 suspect steps in the NAU7802 run and none in the HX711
 one.
 
-Background, evidence and what has already been excluded: see "The I2C bus is
-corrupted whenever the bench supply is on" in `BENCH_NOTES.md`. Do not re-test
-bus speed, the DRDY pin, the DShot signal wire or the pull-ups; all four are
-ruled out by measurement.
+Do not re-test bus speed, the DRDY pin, the DShot signal wire or the pull-ups;
+all four are ruled out by measurement.
 
 ### `sweep_monotonic.py`
 
@@ -526,5 +548,118 @@ wrong encoding.
 Flashing Bluejay is done from a flight controller. Bluejay runs on a SiLabs
 EFM8, and this repository has no route to that bootloader, so reaching it is
 out of scope. That is a fact about Bluejay rather than a policy: on an ARM ESC
-(AM32, BLHeli_32) the passthrough route is open again, and `CLAUDE.md` covers
+(AM32, BLHeli_32) the passthrough route is open again, and `am32.py` below is
 it. See also `docs/HARDWARE.md`.
+
+### `am32.py`
+
+Reads, changes and flashes an AM32 ESC through the vendored 4-Way passthrough.
+
+```bash
+python tools/am32.py read                     # decode the settings page
+python tools/am32.py read --raw               # and print all 192 bytes
+python tools/am32.py set variable_pwm=0 motor_kv=40
+python tools/am32.py dump -o shipped.bin      # back up the application image
+python tools/am32.py flash AM32_x_2.21.hex --verify-only
+python tools/am32.py flash AM32_x_2.21.hex
+```
+
+It needs the board running `vendor/BlHeli-Passthrough/rp2040/` rather than
+`firmware/`, and the ESC powered. Flash the stand firmware back afterwards.
+The passthrough is a separate sketch on purpose: integrating it would hand over
+core 1's PIO pin, block core 0 and share the host's serial line.
+
+What it buys: `esc_firmware` in `stand.json` is a **declared** value, because
+nothing in bidirectional DShot carries a firmware version. A stale declaration
+is recorded confidently into every CSV and looks right forever. On an ARM ESC
+the settings page can be read back and checked, which is the only thing that
+makes it falsifiable.
+
+Four things worth knowing before you use it.
+
+**Back up before you flash.** `dump` writes the application region to a file.
+The bootloader is never erased so a failed write is recoverable, but a vendor's
+shipped image is not downloadable if it predates the public releases.
+
+**The settings page has layout versions and is not self-describing.** Byte 1
+says which, and this tool decodes version 4, from AM32 2.21's `Inc/eeprom.h`.
+On anything else read `--raw` and check the field names against the firmware
+you flashed rather than trusting the labels.
+
+**Check every field after a firmware update.** AM32 2.21 migrates an older page
+in `loadEEpromSettings`, and that migration is incomplete: it clears the bytes
+where layout 1 kept a 12-byte firmware name string, but not the last two, which
+layout 4 reads as `input_type` and `auto_advance`. An ESC can come up with a
+feature enabled by a leftover ASCII character.
+
+**Some settings decide whether a measurement means anything**, and the tool
+prints a note beside those. `brake_on_stop` and `brake_on_zero_throttle` have
+to be 0 or `COASTDOWN` measures the brake rather than the rotor's free decay.
+`variable_pwm` has to be 0 or the switching frequency moves with throttle.
+`motor_kv` is not a motor property at all: it scales AM32's low-RPM duty
+ceiling, so setting it to a high-KV motor's real value can cap a sweep partway
+up while throttle keeps rising.
+
+### `flash_board.py`
+
+Swaps the board between the two sketches, one command per direction.
+
+```bash
+python tools/flash_board.py esc      # then: python tools/am32.py read
+python tools/flash_board.py stand    # then: python measure.py --check
+```
+
+Reading or changing one ESC setting means running the passthrough and then
+putting the stand firmware back. Two flashes per change is enough friction to
+discourage checking a setting at all, which is the wrong incentive for a value
+that is otherwise only declared.
+
+It exists in this shape because **`arduino-cli upload` cannot finish on a host
+with no auto-mounter**. It resets the board into its bootloader correctly and
+then fails with "No drive to deploy", because the RPI-RP2 volume is never
+mounted and `udisksctl` has no polkit agent over ssh. So the two halves are
+done separately: a 1200 baud open-and-close puts the RP2040 in BOOTSEL, and
+`picotool load` writes over USB without mounting anything.
+
+**The wait for re-enumeration at the end is the point, not padding.**
+`picotool` returns as soon as it has rebooted the board, well before the USB
+CDC device is back. Anything that opens the port immediately after gets "No
+such file or directory", which reads like a dead board rather than an impatient
+script. That cost an evening once.
+
+Builds go to a directory under the system temp dir, so nothing lands in the
+repository. `--build-dir` overrides it.
+
+
+## block_compare.py
+
+Plots one block of repeated sweeps against another and puts the ratio in its
+own panel.
+
+    block_compare.py "A=data/branchbase_[0-9]_*.csv" "B=data/motorb_[0-9]_*.csv"
+
+`plot_comparison.py` answers whether a curve has the right shape. This answers
+how two sets of runs differ, which is a different job and needs a different
+figure: sixteen overlaid traces that differ by two percent are unreadable, and
+the same two percent is obvious as a ratio.
+
+**The ratio panel is the tool.** Motor A's 66% throttle step was invisible in
+the overlaid curves and in a matched-RPM table, and unmissable as a ratio.
+
+Two or three blocks, with ratios taken against the first, so name the reference
+block first. The per-step panel marks every throttle step deviating 35% or more
+from its local trend, which is where PWM entrainment locks show up; the trace
+behind it is context, the dots are the finding.
+
+**A fourth block needs a hue that passes the colour-vision check**, not the next
+one that looks different. The obvious green fails deuteranopia separation
+against the orange already in use.
+
+Current against RPM is plotted because the load cell is not in that path, so
+two blocks taken at different scale factors, which any pair either side of a
+mount swap will be, can still be compared honestly. Power against thrust is
+plotted for what the setup delivers, calibration included.
+
+Steps at or above `--amp-limit` are dropped as supply-limited and the excluded
+fraction is printed. A current-limited top end is a property of the supply, and
+the lossier motor sags the rail further and reads as if it were weaker.

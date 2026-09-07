@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+
+# Measurement output stays out of the repo. CSVs diff badly, the dataset will
+# outgrow git as more motors and props are added, and run artefacts should not
+# be mixed with the code that produced them. Runs live in data/ locally.
+/data/
+*.csv
+
+# The raw wire journal measure.py writes beside each run's CSV. Runs written to
+# data/ are already covered; this catches the ones written somewhere else.
+*.raw-*.log
+
+# Per-stand calibration and pole count, written by MASSCHECK. Describes one
+# physical bench, so it is local rather than published.
+stand.json

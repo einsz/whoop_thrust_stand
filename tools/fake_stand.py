@@ -205,7 +205,7 @@ class Model:
 
         A fixed-pitch prop spun backward makes much less thrust, in the
         opposite direction -- not zero, not full magnitude flipped. Measured
-        on the bench (BENCH_NOTES.md, "matched forward/reverse pair"):
+        on the bench with a matched forward/reverse pair:
         remarkably flat ~48-51% of forward magnitude across the whole
         throttle range, so 0.5 here is a real number, not a guess. Without
         this, check_rotation_sign() and every other rotation-vs-thrust-sign
@@ -253,8 +253,7 @@ class Firmware:
         self.fd = fd
         # Fraction of thrust samples delivered as a corrupted I2C transfer. The
         # bench fault this models puts 0xAA in the top byte of the 24-bit word
-        # and varies the rest, which reads as roughly +314 g. See "The I2C bus
-        # is corrupted whenever the bench supply is on" in BENCH_NOTES.md and
+        # and varies the rest, which reads as roughly +314 g. See
         # tools/bus_check.py. Exists so measure.py's rejection can be tested
         # without a faulty bus to hand.
         self.mangle_rate = float(mangle_rate)
@@ -302,10 +301,11 @@ class Firmware:
         self.edt_hz = EDT_HZ
         self.rows = 0
         # Whether the *host* asked for EDT, which is separate from whether this
-        # emulated ESC would answer (--no-edt). Defaults off to match
-        # EDT_REQUEST_DEFAULT in firmware/config.h: unasked, no frames flow and
-        # nothing is flagged stale.
-        self.edt_requested = False
+        # emulated ESC would answer (--no-edt). Tracks EDT_REQUEST_DEFAULT in
+        # firmware/config.h, which became 1 on 2026-09-06. Unasked, no frames
+        # flow and nothing is flagged stale, so this default decides what a
+        # host that says nothing gets.
+        self.edt_requested = True
         # Mirrors firmware's spinReversed: default normal, only a live SPIN,1
         # changes it, always present in the banner (unlike edt=, which is only
         # meaningful once asked).
@@ -419,7 +419,8 @@ class Firmware:
                 self.send("#POLES,%d" % n)
             return
         if cmd.startswith("SPS,"):
-            # Third implementation of the protocol, per CLAUDE.md. The emulated
+            # Third implementation of the protocol, after the firmware and
+            # measure.py. The emulated
             # part follows --load-cell: an emulated HX711 refuses the command
             # exactly as the firmware does, so a host that assumes every board
             # can change rate fails here rather than on the bench.

@@ -133,8 +133,8 @@ fields in it are declarations you have to keep honest yourself:
 
 ```json
 {
-  "esc_firmware": "Bluejay 0.21.0",
-  "esc_pwm_khz": 96,
+  "esc_firmware": "AM32 2.21",
+  "esc_pwm_khz": 48,
   "hx711_scale": -17669.5711,
   "motor_poles": 12,
   "psu": "Kiprim DC310S",
@@ -145,10 +145,16 @@ fields in it are declarations you have to keep honest yourself:
 
 They go into every CSV as a `# setup,` header line, and `--esc-firmware`,
 `--esc-pwm-khz`, `--psu`, `--psu-voltage` and `--prop-hand` override them for
-one run. None of them can be read back from the hardware: **a patched Bluejay
-reports the same version string as a stock one**. That is why `measure.py`
-echoes all five before the motor spins, and warns about any that are unset. A
-blank field is recoverable from your notes; a confidently wrong one is not.
+one run. None of them can be read back over DShot, which carries no firmware
+version at all, and **a patched Bluejay reports the same version string as a
+stock one**. That is why `measure.py` echoes all five before the motor spins,
+and warns about any that are unset. A blank field is recoverable from your
+notes; a confidently wrong one is not.
+
+On an ARM ESC (AM32, BLHeli_32) you can do better than declaring them.
+`tools/am32.py` reads the firmware version and the whole settings page back off
+the ESC over 4-Way, so the declaration becomes checkable rather than trusted.
+See [docs/HARDWARE.md](docs/HARDWARE.md).
 
 `esc_dir_forward` is a bench-level fact, not a per-run one. It names which ESC
 spin direction is the *whole current prop set's* own design-forward direction:
@@ -185,6 +191,10 @@ python measure.py --check                      # does not spin the motor
 
 `--check` prints the boot banner, scans the I²C bus, shows live samples and
 reports the ambient reading. Everything should answer before you go further.
+
+**`-m` has no default, so a command without one never spins the motor.**
+`--check`, `--tare` and `--watch` work on their own; anything that drives the
+motor has to name its mode.
 
 ```bash
 python measure.py --check --tare --watch 180   # zero drift + link quality
@@ -226,6 +236,15 @@ backend, so it works over ssh. The file extension picks the format.
 Pass `--prop-diameter-mm` whenever you know it: it enables a physics-based QC
 gate that catches wrong constants without your having to anticipate the failure.
 Use `--poles N` if your motor is not the 12-pole default.
+
+**A run that fails still writes its data.** If the board drops off the bus, the
+firmware aborts, or you hit Ctrl-C, `measure.py` saves the rows it had, marks
+the file `# result,status=aborted,reason=...` and exits non-zero (130 for
+Ctrl-C). Beside the CSV it leaves a raw log of every line the board sent, named
+in `# raw_capture`. Nothing is fitted or reported from a partial run, and an
+interrupted `MASSCHECK` never writes a calibration factor. Tools that read one
+say so: `plot_comparison.py` labels it "(partial)". See
+[docs/COLUMNS.md](docs/COLUMNS.md#partial-runs).
 
 To look at a narrow band in more detail than whole percent allows:
 
@@ -309,6 +328,12 @@ python tools/fake_stand.py --serve                        # expose a pty, print 
 
 Arguments after `--` are forwarded to `measure.py`.
 
+`tests/` holds host tests that need no pty at all: they drive `measure.py`
+through an in-memory serial peer to check what happens when a run fails. Run
+them with `python -m unittest discover -s tests`. They cover host behaviour
+only. Firmware safety is verified on hardware, and the emulator remains the
+check for a full protocol end to end.
+
 ---
 
 ## Why the measurements are shaped this way
@@ -380,15 +405,23 @@ Arguments after `--` are forwarded to `measure.py`.
 ### Extended DShot Telemetry
 
 > Optional and advanced. EDT is a low-rate ESC status channel; you do not need
-> it to take a sweep, and the default configuration leaves it off.
+> it to take a sweep.
 
-**EDT is off by default.** Turn it on for a session with `measure.py --edt`, or
-for a build by setting `EDT_REQUEST_DEFAULT` to 1 in `firmware/config.h`. Asked,
-the firmware sends DShot command 13 at boot and at every sequence start, and the
-banner records `edt=1` so a run says whether it asked.
+**Whether the stand asks for EDT is a setting, not a fixed answer**, because
+whether an ESC replies is a property of its firmware. `EDT_REQUEST_DEFAULT` in
+`firmware/config.h` sets what a build does, and `measure.py --edt` and
+`--no-edt` override it for one run without a reflash. Asked, the firmware sends
+DShot command 13 at boot and at every sequence start, and the banner records
+`edt=1` so a run says whether it asked.
 
-It is off because support is an ESC-firmware property that nothing can read
-back. A channel that never answers is worse than no channel: `edt_stale` lands
+**Check your own ESC before trusting the default.** The reference build ships
+with it on, because the fitted AM32 ESC answers readily. An earlier Bluejay ESC
+on this same stand stopped sending EDT the moment it armed and never resumed
+without a power cycle, and on an ESC like that you want `--no-edt` or a build
+default of 0.
+
+The reason it is a choice at all is that support is an ESC-firmware property
+that nothing can read back. A channel that never answers is worse than no channel: `edt_stale` lands
 on every row of every run. A flag that is always set is a flag nobody reads.
 Empty `esc_*` columns then mean two opposite things: unasked says nothing about
 your ESC, asked-and-empty is a finding about it. That is exactly what the banner
@@ -543,6 +576,11 @@ tools/approach_test.py      host: does approach direction change the reported pe
 docs/HARDWARE.md            bill of materials, wiring, gotchas
 docs/CALIBRATION.md         load cell calibration procedure
 docs/COLUMNS.md             what every CSV column means
+tests/                      host tests for the failure paths, no hardware needed
+tools/am32.py               host: read, change and flash AM32 ESC settings
+tools/flash_board.py        host: swap the board between stand firmware and passthrough
+tools/block_compare.py      host: one block of repeated sweeps against another
+vendor/BlHeli-Passthrough/  4-way passthrough sketch, vendored, GPL-3.0
 LICENSE                     GPL-3.0
 data/                       measurement output (not tracked)
 ```

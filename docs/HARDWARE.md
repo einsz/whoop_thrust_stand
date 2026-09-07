@@ -13,7 +13,7 @@ connections fail in ways that look like a dead component, so read the gotchas.
 | Load cell ADC | **HX711** (24-bit, 80 SPS) or **NAU7802** (24-bit, up to 320 SPS, I²C). Pick one and set `LOADCELL_NAU7802` in `config.h`. On an HX711 get a board where the `RATE` pin is accessible, because we want the 80 SPS high rate. The NAU7802 costs more but repays it twice over: 4× the rate, and a working internal regulator (see the gotcha below). |
 | INA226 breakout | **Check the shunt before buying.** Most ship with R100, which caps you at 0.8 A. You want at most R010. See the gotcha below. INA219/INA23x also work; set the values in `config.h`. |
 | BMP280 breakout | Ambient temperature and pressure; humidity is not measured, though a BME280 would add it (see [Possible future upgrades](#possible-future-upgrades)). Optional but strongly recommended (see below). |
-| ESC | Any ESC supporting **bidirectional DShot**, so telemetry returns over the signal wire, so no separate telemetry pad is needed. Reference build: an **XSD 7A 1–2S** flashed to **Bluejay v0.21.0**. |
+| ESC | Any ESC supporting **bidirectional DShot**, so telemetry returns over the signal wire, so no separate telemetry pad is needed. Reference build: an **AM32 1–2S 20 A** on an AT32F421, running **AM32 2.21**. An **XSD 7A 1–2S** on **Bluejay v0.21.0** was used before it, and most of the ESC-specific findings in this repository were measured on that one. |
 | Motor + prop | The thing under test. |
 | Bench supply | Optional, but it makes `KV` mode possible and keeps voltage constant across a sweep. |
 | Calibration masses | Several known weights spanning your thrust range. Accuracy here sets the accuracy of everything. |
@@ -288,9 +288,21 @@ Bluejay it is out of scope: those run on a SiLabs EFM8, and this stand has no
 route to that bootloader. Flash and configure them from a flight controller.
 
 ARM-based ESCs (AM32, BLHeli_32) speak the 4-Way protocol over the same signal
-wire the stand already drives, so the board can pass a configurator through to
-them. That is not wired up yet, and until it is, a USB linker or a flight
-controller does the job.
+wire the stand already drives, so the board can reach them directly. That is
+wired up. Flash `vendor/BlHeli-Passthrough/rp2040/` in place of `firmware/` and
+the board presents itself to a configurator as if it were a flight controller;
+`tools/flash_board.py` does each swap in one command. `tools/am32.py` then reads
+the settings page, changes named fields and flashes the ESC without a
+configurator at all.
+
+**That matters for more than convenience.** `esc_firmware` in `stand.json` is a
+value you declare, because nothing in bidirectional DShot carries a firmware
+version, and a stale declaration is written into every CSV and looks right
+forever. On an ARM ESC it can be read back and checked instead. It is also the
+only way to see settings that decide whether a measurement means anything: a
+brake that turns a `COASTDOWN` into a measurement of the brake, a switching
+frequency that moves with throttle, or a duty ceiling that flattens the top of
+a sweep while throttle keeps rising.
 
 **Do not fit an external pull-up on the DShot line.** The line idles high and
 the ESC pulls it low, so *if* you fitted one it would have to be a pull-**up**.

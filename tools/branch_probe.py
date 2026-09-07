@@ -3,8 +3,8 @@
 
 The motor intermittently mis-commutates into a slower branch: 100-400 ms
 excursions from ~18,000 to ~12,000 RPM at *higher* current, several per 10 s
-hold. See "The branch is sub-second DIPPING" in BENCH_NOTES.md. Current rising
-through the dip is the signature that separates it from lost telemetry.
+hold. Current rising through the dip is the signature that separates it from
+lost telemetry.
 
 **Approach is the only handle ever found on it.** Jumping to the setpoint from a
 standstill provoked dips in 4 of 8 runs, while a 1% staircase up from idle or a
@@ -90,6 +90,12 @@ def hold(ser, cols, pct, log_ms, settle_ms, budget):
     return rows
 
 
+# Below this, the "upper branch" is a motor that never started rather than one
+# that ran and dipped. Without the check, a crawl at ~600 RPM reports excursions
+# to ~500 as dips against its own median and the run declares the fault live.
+FAILED_START_RPM = 2000
+
+
 def find_dips(rows):
     """Excursions below DIP_FRACTION of the run's own upper branch.
 
@@ -119,6 +125,28 @@ def find_dips(rows):
                              statistics.mean(ua[start:i]) / 1e6))
             start = None
     return upper, dips, min(rpm)
+
+
+def esc_temp(rows):
+    """Median ESC temperature across a hold, or None if EDT answered nothing.
+
+    Zero means no reading rather than freezing point: the column reads 0
+    whenever no EDT frame has arrived. Temperature is the obvious covariate for
+    provocability and neither the 2026-08-20 nor the 2026-09-06 session recorded
+    it, which is why they could not be compared.
+    """
+    vals = []
+    for r in rows:
+        v = r.get("esc_temp_c")
+        if v in (None, "", "-"):
+            continue
+        try:
+            v = float(v)
+        except ValueError:
+            continue
+        if v > 0:
+            vals.append(v)
+    return statistics.median(vals) if vals else None
 
 
 def main():
@@ -151,6 +179,7 @@ def main():
         time.sleep(1.0)
 
         seen = 0
+        temps = []
         trials = [(t, n) for t in throttles for n in range(1, args.attempts + 1)]
         for thr, n in trials:
             rows = hold(ser, cols, thr, args.log_ms, 500, args.log_ms / 1000.0 + 22)
@@ -158,31 +187,46 @@ def main():
             if upper is None:
                 print("th %2d #%d: only %d rows, skipped" % (thr, n, len(rows)))
                 continue
+            if upper < FAILED_START_RPM:
+                # Not a dip: nothing ran. Counting it would report the fault
+                # live on a motor that never left standstill.
+                print("th %2d #%d: FAILED START, upper only %.0f RPM"
+                      % (thr, n, upper))
+                ser.write(b"STOP\n")
+                time.sleep(args.rest_s)
+                continue
             base = statistics.median(float(r["bus_ua"]) for r in rows) / 1e6
+            temp = esc_temp(rows)
+            temps.append(temp)
+            hot = "%3.0f C" % temp if temp is not None else "  ? C"
             if dips:
                 seen += 1
-                print("th %2d #%d: upper %6.0f RPM, base %.3f A   ** %d DIP(S) **"
-                      % (thr, n, upper, base, len(dips)))
+                print("th %2d #%d: upper %6.0f RPM, base %.3f A, %s   ** %d DIP(S) **"
+                      % (thr, n, upper, base, hot, len(dips)))
                 for ms, lo, amps in dips:
                     print("            %5.0f ms  min %6.0f RPM (%.0f%%)  %.3f A (%+.1f%%)"
                           % (ms, lo, 100.0 * lo / upper, amps,
                              100.0 * (amps - base) / base if base else 0.0))
             else:
-                print("th %2d #%d: upper %6.0f RPM, base %.3f A, min %6.0f RPM "
+                print("th %2d #%d: upper %6.0f RPM, base %.3f A, %s, min %6.0f RPM "
                       "(%.0f%%), clean"
-                      % (thr, n, upper, base, low, 100.0 * low / upper))
+                      % (thr, n, upper, base, hot, low, 100.0 * low / upper))
             ser.write(b"STOP\n")
             time.sleep(args.rest_s)
 
-        print("\n%d of %d attempts showed a dip" % (seen, len(trials)))
+        known = [t for t in temps if t is not None]
+        span = ("ESC %.0f to %.0f C" % (min(known), max(known))) if known else "ESC temp unknown"
+        print("\n%d of %d attempts showed a dip   (%s)" % (seen, len(trials), span))
         if not seen:
-            print("A clean run of attempts is NOT a fix. Provocability fades within")
-            print("a session, so a negative taken late in one says very little --")
-            print("run this first, before anything else spins the motor.")
+            print("A clean run of attempts is NOT a fix, an error made twice here.")
+            print("Record the temperature span above with the result: provocability")
+            print("faded across one 2026-08-20 session and arrived late in a")
+            print("2026-09-06 one, so WHEN to probe is an open question, not a rule.")
         else:
             print("THE FAULT IS LIVE. Drop everything and take the measurements that")
-            print("need it: a scope trace (tools/phase_probe.py, trigger below")
-            print("13,500 RPM) and the old ~19 kKV motor swap.")
+            print("need it: the old ~19 kKV motor swap, and a scope trace via")
+            print("tools/phase_probe.py triggered well below the upper branch shown")
+            print("above -- about 11,000 RPM when that branch sits near 15,000.")
     finally:
         ser.write(b"STOP\n")
         time.sleep(0.5)

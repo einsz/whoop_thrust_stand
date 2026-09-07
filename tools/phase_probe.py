@@ -42,6 +42,7 @@ That is precisely why every trace is verified by its own period, and why a
 capture that fired below the threshold is not by itself a collapsed trace.
 """
 import argparse
+import datetime
 import importlib.util
 import os
 import sys
@@ -91,7 +92,11 @@ def main():
                          "not on its shoulder.")
     ap.add_argument("--channels", default="CH1",
                     help="Comma separated, e.g. CH1,CH2")
-    ap.add_argument("--tag", default="phase")
+    # Timestamped by default. A fixed tag silently overwrote a healthy baseline
+    # on 2026-09-06, and a scope capture of a fault that fades is not something
+    # you can go back and retake.
+    ap.add_argument("--tag", default=None,
+                    help="filename prefix; defaults to phase-<UTC timestamp>")
     ap.add_argument("--outdir", default=os.path.join(ROOT, "data"))
     args = ap.parse_args()
 
@@ -258,6 +263,9 @@ def main():
         }
 
     os.makedirs(args.outdir, exist_ok=True)
+    if args.tag is None:
+        args.tag = "phase-" + datetime.datetime.now(
+            datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     print()
     for cap in captures:
         st = state_at(cap)

@@ -13,6 +13,8 @@ The header carries everything needed to interpret the file on its own:
 - the calibration factor: `# calibration`
 - the declared setup, run rotation and (when given) the specimen: `# setup`
 - the telemetry link health for the run: `#STATS`
+- whether the run finished, and where its raw wire log went: `# result`,
+  `# raw_capture`
 
 `RESPONSE` runs additionally carry the commanded step levels as
 `# response,base=..,high=..,reps=..`. `plot_comparison.py` reads columns by
@@ -64,6 +66,35 @@ The consuming site reads `# setup,specimen=` first, and falls back to a
 record that restates a specimen the file already declares fails the site build.
 `specimen` is a controlled dimension only among runs naming the same prop model,
 since it varies by definition across different models.
+
+## Partial runs
+
+`# result` says whether the run completed its protocol: `status=complete`, or
+`status=aborted,reason=...` naming what stopped it. A run that fails, loses the
+board or is stopped with Ctrl-C still writes the rows it collected. An aborted
+file is a real measurement of a shorter run, not a corrupt one.
+
+Read those rows, but not as a protocol. A sweep can be missing its entire down
+leg, a mass check half its masses, a Kv run every voltage above the first. So
+anything that assumes a complete set has to check the marker first.
+`measure.py --rescale`, `--refit` and `--kv-pair` warn on one, and
+`plot_comparison.py` appends "(partial)" to the run's label, because a figure
+gets shared and a console warning does not travel with it.
+
+An aborted file still carries the calibration factor, the declared setup and
+rotation, the ambient conditions and the density-normalised thrust column.
+Density cannot be applied after the fact, so it is applied whatever the
+outcome. It also carries the firmware's own account of the ending: the
+`# warn,sequence_aborted,<reason>` line and the `#STATS` telemetry health for
+the shortened run.
+
+What it does not carry is any conclusion. No fit, no report, no updated
+`stand.json`: an interrupted MASSCHECK never writes a calibration factor.
+
+`# raw_capture,file=<name>` names the wire journal written beside the CSV,
+holding every line the board sent during the run. Successful runs get one too.
+It is a debugging record rather than an input to any tool, it is gitignored,
+and it can be deleted once the run is understood.
 
 ## Firmware columns vs CSV columns
 
@@ -237,6 +268,7 @@ second axis of the fit; `v_set` is the commanded supply voltage.
 | `v_set` | the commanded supply voltage |
 | `duty_fitted` | the fitted duty for this DShot level: 1.0 for the top level, lower levels fitted by the Kv solve. Blank for points whose level was excluded from the fit (a failed start) |
 | `v_psu`, `a_psu` | the supply's own meter, read once mid-hold. At the supply's terminals rather than the stand's, so `v_psu - volts_mean` is the harness drop and `a_psu` is an independent check on the shunt value. Blank unless `--psu-port` drove the sweep |
+| `esc_temp_max_c`, `esc_stress_max`, `n_edt` | as in the steady-state set. Added 2026-09-07: start behaviour near the motor's lower voltage limit changes as the ESC warms, and a Kv run had no way to record that. Read `n_edt` alongside the temperature, since a stale frame holds its last value |
 
 ## Mass-check set
 

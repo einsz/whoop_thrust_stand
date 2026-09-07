@@ -71,7 +71,7 @@ volatile uint8_t motorPoles = MOTOR_POLES_FALLBACK;
 // straight into the part. Sending that to an ADC whose begin() failed talks to
 // an unconfigured device and hung the board on 2026-09-02, recoverable only by
 // a power cycle -- core 1's backstop is disarmed at zero throttle, which is
-// exactly where the command is legal. See BENCH_NOTES.md.
+// exactly where the command is legal.
 bool loadCellInitOk = false;
 
 // The conversion rate actually in force. config.h sets the boot value; `SPS,<n>`
@@ -135,6 +135,12 @@ const uint32_t RPM_STALE_US    = 20000;
 // is orders of magnitude looser than the others. It exists to catch EDT stopping
 // altogether -- which some ESCs do once armed -- rather than to time frames.
 const uint32_t EDT_STALE_US    = 3000000;
+// How often core 1 re-asks for EDT when it was requested and no frames are
+// arriving. The enable command is only valid stopped, so this only ever fires
+// with the throttle at zero and never during a run. Five seconds is slow enough
+// that an ESC which will never answer costs ~10 command frames per 20,000, and
+// fast enough that an ESC powered after the Pico starts reporting promptly.
+const uint32_t EDT_RETRY_US    = 5000000;
 
 // --- Safety ---
 // Armed by the first PING. A human at a serial monitor is present and can react,
@@ -171,10 +177,10 @@ const uint8_t FLAG_EDT_STALE     = 1 << 6;
 // that those cases are visible (edt_stale, blank columns) rather than silently
 // frozen, but do not build a measurement on EDT. See docs/HARDWARE.md.
 //
-// Because of that, asking for it at all is opt-in: EDT_REQUEST_DEFAULT in
-// config.h, or `EDT,1` at runtime. Off, the enable command is never sent and
-// FLAG_EDT_STALE is never raised -- an ESC that will never answer should not
-// flag every row of every run. Decoding is unconditional either way; see
+// Because of that, asking for it at all is a setting: EDT_REQUEST_DEFAULT in
+// config.h, or `EDT,<0|1>` at runtime. Off, the enable command is never sent
+// and FLAG_EDT_STALE is never raised -- an ESC that will never answer should
+// not flag every row of every run. Decoding is unconditional either way; see
 // loop1().
 const uint16_t DSHOT_CMD_EDT_ENABLE = 13;
 const uint8_t  EDT_ENABLE_REPEATS   = 10;
@@ -273,6 +279,9 @@ volatile uint32_t escAlertCount    = 0;
 // reported once per step for the length of a run as if it had been measured.
 volatile uint32_t edtSeq           = 0;
 volatile uint32_t lastEdtUpdateUs  = 0;
+// When core 1 last re-asked for EDT. Separate from lastEdtUpdateUs so a silent
+// ESC is retried on a fixed cadence rather than every single frame.
+volatile uint32_t lastEdtRetryUs   = 0;
 // Set by core 1 when a status frame carries error/warning/alert bits, cleared by
 // core 0 on the next row printed. A lost or doubled flag across the core
 // boundary costs one row's marking; escAlertCount is the authoritative tally.
@@ -864,8 +873,8 @@ void setup() {
   // Bound every I2C transaction and reset the peripheral on a timeout. The
   // default is a second per transfer, which core 0 spends inside serviceIna()
   // or serviceAmbient() with the motor turning and nothing being serviced. The
-  // bus has hung with the motor rail live before (BENCH_NOTES.md, 2026-08-14,
-  // still unexplained); 25 ms is far longer than any read here needs and short
+  // bus has hung with the motor rail live before and it is still
+  // unexplained; 25 ms is far longer than any read here needs and short
   // enough that a hung bus degrades the sample rate instead of the run.
   Wire.setTimeout(25, true);
 
@@ -1592,5 +1601,35 @@ void loop1() {
       telemBadCount++;
       telemSilentCount++;
       break;
+  }
+
+  // Re-ask for EDT when it was requested and nothing is answering.
+  //
+  // The enable is queued in setup1() and in resetSequenceCounters(), and both
+  // are events rather than states: boot the Pico against a dead ESC rail and
+  // those frames go nowhere, and `--check` triggers no sequence, so nothing
+  // re-requests. The banner then reads edt=1 beside zero frames, which is
+  // indistinguishable from an ESC that has no EDT support -- the one thing the
+  // edt= field exists to tell apart. Measured on the bench 2026-09-06: the same
+  // --check gave 0 frames booted against a dead rail and 1,345 in 8 s booted
+  // against a live one.
+  //
+  // This does not paper over a real finding. An ESC that never answers still
+  // ends the run with edt_frames=0 and FLAG_EDT_STALE set, because retrying
+  // changes nothing about what came back. What it removes is the case where the
+  // stand never asked in a way the ESC could hear.
+  //
+  // Gated on currentDshotValue == 0 for the same reason the send chain above is:
+  // a command frame where a throttle frame belongs would be read as a throttle
+  // value. So this can never fire during a sequence.
+  if (edtRequested && !edtEnablePending && currentDshotValue == 0) {
+    uint32_t nowUs = micros();
+    // Both comparisons are on unsigned differences, so the ~72 minute micros()
+    // wrap needs no special case.
+    if (nowUs - lastEdtUpdateUs > EDT_STALE_US &&
+        nowUs - lastEdtRetryUs > EDT_RETRY_US) {
+      edtEnablePending = EDT_ENABLE_REPEATS;
+      lastEdtRetryUs = nowUs;
+    }
   }
 }

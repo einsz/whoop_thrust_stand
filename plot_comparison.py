@@ -127,6 +127,21 @@ def row_flag_names(row):
     return {n for n in (row.get("flag_names") or "").split("|") if n}
 
 
+def is_partial(meta):
+    """True if this run stopped early and holds only the rows it got to.
+
+    measure.py saves what it collected when a run fails, which is the right
+    thing for the samples and the wrong thing to plot silently: a sweep that
+    died at 40% throttle draws a curve that simply ends, and nothing about the
+    line says why. Runs written before the marker existed report False, which
+    is all that can be said about them.
+    """
+    for entry in meta.get("result", []):
+        if entry.strip().startswith("status=aborted"):
+            return True
+    return False
+
+
 def drop_flagged(rows, label):
     clean = [r for r in rows if not (row_flag_names(r) & FATAL_FLAGS)]
     dropped = len(rows) - len(clean)
@@ -358,6 +373,13 @@ def main():
         meta, rows = parse_csv(path)
         if not rows:
             continue
+        if is_partial(meta):
+            # Into the label, not just the console: the figure gets shared and
+            # the warning does not travel with it.
+            reason = meta["result"][0].partition("reason=")[2]
+            print("[WARN] %s is a PARTIAL run (%s) -- plotted as (partial)"
+                  % (label, reason or "no reason recorded"), file=sys.stderr)
+            label += " (partial)"
         metas[label] = meta
         if not args.keep_flagged:
             rows = drop_flagged(rows, label)

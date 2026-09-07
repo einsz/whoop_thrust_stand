@@ -3,8 +3,7 @@
 
 The stand's I2C bus is corrupted whenever the bench supply is switched on --
 roughly one transfer in a thousand, at zero load, with the ESC disconnected and
-no current flowing. See "The I2C bus is corrupted whenever the bench supply is
-on" in BENCH_NOTES.md. This tool is how that was measured and how any fix gets
+no current flowing. This tool is how that was measured and how any fix gets
 scored, so a session does not have to reinvent the method.
 
 Two things it counts, and they are independent evidence:
@@ -186,7 +185,7 @@ def report_live(runs):
         print("\n  The bus is mangling transfers. A register that cannot change came")
         print("  back wrong, so a corrupt thrust sample is a corrupt READ. Already")
         print("  excluded by measurement: bus speed, the DRDY pin, the DShot signal")
-        print("  wire, pull-ups. See BENCH_NOTES.md before repeating any of those.")
+        print("  wire, pull-ups. All four are ruled out by measurement.")
     else:
         print("\n  No mangled transfers. Weaker evidence than a hit -- the ADC read is")
         print("  3 bytes to the probe's 1. Confirm the rail was ON: with it off this")

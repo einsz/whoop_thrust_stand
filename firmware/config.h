@@ -54,13 +54,19 @@ const int  DSHOT_RATE = 600;   // 150 / 300 / 600 / 1200
 // the motor has armed and no amount of re-requesting revives it.
 //
 // Turn it on if your ESC supports it properly -- esc_stress is a genuine
-// desync canary when it works. Either set this to 1, or leave it and pass
-// `measure.py --edt` per session, which needs no reflash.
+// desync canary when it works. Both directions have a runtime override that
+// needs no reflash: `measure.py --edt` forces it on, `--no-edt` forces it off.
+//
+// **Default changed from 0 to 1 on 2026-09-06**, when the fitted ESC changed to
+// one that answers. The old default was set against a Bluejay build that stops
+// sending EDT once it arms, where asking gained nothing and put edt_stale on
+// every row. If your ESC is like that, set this back to 0 or pass --no-edt:
+// flags nobody can trust are worse than no flags.
 //
 // This only controls whether the stand *asks* for EDT. Frames are always
 // decoded if they arrive: they are valid telemetry, and treating them as
 // anything else counts every one as a link error.
-#define EDT_REQUEST_DEFAULT 0
+#define EDT_REQUEST_DEFAULT 1
 
 // NOTE: the motor's pole count is not here. It is a property of whatever motor
 // is mounted, not of the board, so it lives in stand.json (or `--poles N`) and
@@ -115,7 +121,7 @@ const int NAU7802_SPS = 320;
 // This is the whole point of the part on this bench. The HX711's on-chip
 // regulator targets ~4.3 V and cannot reach it from 3V3, so it saturates and
 // its AVDD just follows the Pico's switching rail with no supply rejection at
-// all -- measured 3.23 V at E+ where it should read 4.3. See BENCH_NOTES.md.
+// all -- measured 3.23 V at E+ where it should read 4.3.
 //
 // Do NOT raise this by powering the part from 5 V: the I2C pull-ups would then
 // sit at 5 V into non-tolerant Pico pins.

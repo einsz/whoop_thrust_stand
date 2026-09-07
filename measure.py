@@ -53,6 +53,7 @@ import statistics
 import sys
 import threading
 import time
+import tempfile
 
 import serial
 
@@ -71,6 +72,11 @@ FLAG_RPM_STALE = 1 << 3
 FLAG_WATCHDOG = 1 << 4
 FLAG_ESC_ALERT = 1 << 5
 FLAG_EDT_STALE = 1 << 6
+
+# How long to keep reading after the firmware reports an abort. endSequence()
+# needs only the time to read one ambient snapshot; the bound is what ends a
+# run whose error came with no sequence teardown behind it.
+ABORT_DRAIN_S = 5.0
 
 # Banner keys describing the configuration in force: exactly one value is true at
 # a time, so a reprint replaces rather than accumulates. "ambient" and "stats"
@@ -126,7 +132,7 @@ def save_stand_config(updates):
 # than on a per-run flag. --reverse (a per-run flag; see its help text) is
 # combined with this to compute the actual SPIN command. Sticky state that is
 # not echoed every run is exactly how a reversed ESC direction survived a
-# reboot unnoticed (see BENCH_NOTES.md), so this is echoed and warned-about
+# reboot unnoticed, so this is echoed and warned-about
 # exactly like the other four -- and unlike the other four, an unset value
 # refuses to start a real run (see main()): a wrong one mis-declares an entire
 # session, and both the banner warning and the site's sign check only catch it
@@ -271,6 +277,34 @@ class Link:
         self.flag_names = {}
         self.ambient = {}
         self._stop = threading.Event()
+        self.journal = None
+        self.journal_path = None
+        self.acquiring = False
+        self.partial_rows = []
+        self.partial_snapshot = None
+        self.pending_abort = None
+        self.abort_deadline = 0.0
+
+    def begin_capture(self, output):
+        """Keep received wire data even if acquisition or summarizing fails."""
+        parent = os.path.dirname(os.path.abspath(output))
+        os.makedirs(parent, exist_ok=True)
+        self.journal = tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=parent,
+            prefix=os.path.basename(output) + ".raw-", suffix=".log",
+            delete=False, buffering=1)
+        self.journal_path = self.journal.name
+        for key, values in self.meta.items():
+            for value in values:
+                self.journal.write("#%s,%s\n" % (key.upper(), value))
+        self.journal.write("#CALIBRATION,hx711_scale=%s\n" % self.scale)
+        self.acquiring = True
+        print("Raw capture: %s" % self.journal_path)
+
+    def recovered_rows(self):
+        if self.partial_snapshot is not None:
+            return self.partial_snapshot()
+        return self.partial_rows
 
     # -- io ---------------------------------------------------------------
     def write_line(self, text):
@@ -278,7 +312,18 @@ class Link:
             self.ser.write((text + "\n").encode("utf-8"))
 
     def readline(self):
-        return self.ser.readline().decode("utf-8", "replace").strip()
+        line = self.ser.readline().decode("utf-8", "replace").strip()
+        if self.journal is not None and line:
+            self.journal.write(line + "\n")
+        if self.acquiring and line == "SYSTEM_READY":
+            raise RuntimeError("firmware restarted during acquisition")
+        if self.pending_abort is not None and (line.startswith("END_")
+                                               or time.time() > self.abort_deadline):
+            # The teardown has been read (or is not coming). Raise now, with the
+            # stats and closing ambient already absorbed into the metadata.
+            reason, self.pending_abort = self.pending_abort, None
+            raise RuntimeError("firmware: " + reason)
+        return line
 
     def start_keepalive(self, interval=0.25):
         """Arms the firmware watchdog and keeps it fed.
@@ -296,8 +341,12 @@ class Link:
 
     def close(self):
         self._stop.set()
-        if self.ser.is_open:
-            self.ser.close()
+        try:
+            if self.ser.is_open:
+                self.ser.close()
+        finally:
+            if self.journal is not None:
+                self.journal.close()
 
     # -- banner -----------------------------------------------------------
     def absorb_meta(self, line):
@@ -325,6 +374,25 @@ class Link:
                     self.flag_names[int(bit)] = name
                 except ValueError:
                     pass
+        if self.acquiring and (key == "error" or
+                               (key == "warn" and rest.startswith("sequence_aborted,"))):
+            self.meta.setdefault(key, []).append(rest)
+            # Latch, do not raise. endSequence() prints the abort reason first
+            # and the stats, closing ambient and END_ sentinel after it, so
+            # raising here would drop the telemetry health record on exactly
+            # the runs that need explaining. readline() raises once it has read
+            # the sentinel, or once ABORT_DRAIN_S proves none is coming --
+            # `#ERROR,busy` and the like arrive with no teardown behind them.
+            #
+            # Note what raising costs: main() unwinds to an immediate STOP, not
+            # the measured spin-down ramp. That is right for the aborts we get
+            # today, which all reach here with the throttle already at zero.
+            # A firmware `#ERROR` printed while the motor is spinning would not
+            # be, so anything that adds one has to send the ramp itself first.
+            if self.pending_abort is None:
+                self.pending_abort = body
+                self.abort_deadline = time.time() + ABORT_DRAIN_S
+            return
         if key in SINGLETON_META:
             # `ID` reprints the banner, and POLES makes that reprint differ from
             # boot. Appending would leave two "# esc" lines in the CSV disagreeing
@@ -779,6 +847,12 @@ KV_FIELDS = [
     # terminals rather than at the stand, so v_psu - volts_mean is the harness
     # drop and a_psu is an independent check on INA_SHUNT_UOHM.
     "v_psu", "a_psu",
+    # The accumulator has always computed these; the field list dropped them,
+    # so a Kv run recorded no temperature at all. That cost a session: nine
+    # start attempts decayed from three-of-three to zero-of-three and the
+    # thermal reading could not be checked. n_edt comes with the temperature
+    # because a held value and a live one look identical without it.
+    "esc_temp_max_c", "esc_stress_max", "n_edt",
     "n_rpm_stale", "n_thrust_stale", "n_thrust_missed", "n_thrust_mangled", "n_ina_missed", "n_ina_mangled",
     "erpm_raw_hist", "flags", "flag_names",
 ]
@@ -813,7 +887,7 @@ TRANSIENT_FIELDS = [
 # that returns empty on timeout. When core 0 stalled mid-sweep with the throttle
 # latched, the host sat in one of them forever -- so Ctrl-C was the only way out,
 # and even that only reached a `finally` whose STOP the firmware was no longer
-# reading. See BENCH_NOTES.md, 2026-08-20.
+# reading.
 HARVEST_SILENCE_S = 20.0
 
 
@@ -855,6 +929,11 @@ def run_sweep(link):
     dshot_of = {}
     recording = False
     PHASE_UP, PHASE_DOWN = 2, 4
+    def snapshot():
+        return [groups[(p, t)].summarize(
+            link, "sweep", t, dshot_of[(p, t)], "up" if p == PHASE_UP else "down")
+            for p, t in sorted(groups) if p in (PHASE_UP, PHASE_DOWN)]
+    link.partial_snapshot = snapshot
     quiet = SilenceTimer("END_SWEEP")
 
     while True:
@@ -1082,6 +1161,7 @@ def report_hysteresis(rows):
 def run_static(link):
     print("Starting host-timed static step test...")
     results = []
+    link.partial_rows = results
     for throttle in THROTTLE_STEPS:
         print("--> %d%%..." % throttle, end="", flush=True)
         link.write_line(str(throttle))
@@ -1090,10 +1170,15 @@ def run_static(link):
 
         acc = Accumulator()
         dshot = 0
+        link.partial_snapshot = lambda: results + (
+            [acc.summarize(link, "static", throttle, dshot)] if acc.rows else [])
         deadline = time.time() + 5.0
         while len(acc.thrust) < SAMPLES_PER_STEP and time.time() < deadline:
             line = link.readline()
-            if not line or line.startswith("#"):
+            if line.startswith("#"):
+                link.absorb_meta(line)
+                continue
+            if not line:
                 continue
             row = link.parse_row(line)
             if row is None:
@@ -1101,6 +1186,7 @@ def run_static(link):
             acc.add(row)
             dshot = row["dshot"]
         results.append(acc.summarize(link, "static", throttle, dshot))
+        link.partial_snapshot = None
         print(" done (%d unique thrust samples)" % len(acc.thrust))
 
     link.write_line("0")
@@ -1113,6 +1199,7 @@ def collect_samples(link, command, start_prefix, end_token, mode):
     link.write_line(command)
 
     logs = []
+    link.partial_rows = logs
     recording = False
     t0 = None
     last_seq = {"n_rpm": None, "n_thrust": None, "n_ina": None, "n_edt": None}
@@ -1323,17 +1410,14 @@ def run_kv(link, voltages, hold_ms, psu_port=None, dshots=(2000,), settle_ms=150
         if not psu.output_on():
             print("[ERROR] the supply's output is off; enable it before a Kv sweep "
                   "(python tools/psu.py --output on)", file=sys.stderr)
-            return []
+            raise RuntimeError("supply output is off")
 
     points = []
+    link.partial_rows = points
     for v_set in voltages:
         if psu is None:
             print("\n>>> Set the bench supply to %.2f V (18650 disconnected)." % v_set)
-            try:
-                input("    Press Enter when settled, or Ctrl-C to stop: ")
-            except (EOFError, KeyboardInterrupt):
-                print("\n    stopping voltage sweep")
-                break
+            input("    Press Enter when settled, or Ctrl-C to stop: ")
         else:
             print("\n>>> Supply to %.2f V..." % v_set, end="", flush=True)
             try:
@@ -1352,7 +1436,7 @@ def run_kv(link, voltages, hold_ms, psu_port=None, dshots=(2000,), settle_ms=150
                 if first_step:
                     print("        On the first step this is usually the 18650 "
                           "still connected.", file=sys.stderr)
-                break
+                raise
             first_step = False
 
         # All throttle levels at this voltage before moving the supply: a
@@ -1377,6 +1461,15 @@ def run_kv_hold(link, psu, psu_mod, v_set, dshot, hold_ms, settle_ms=1500):
     acc = Accumulator()
     recording = False
     supply, supply_tried = None, False
+    def snapshot():
+        if not acc.rows:
+            return link.partial_rows
+        s = acc.summarize(link, "kv", round(dshot / 20.0), dshot)
+        s.update(v_set=v_set, dshot=dshot)
+        if supply:
+            s["v_psu"], s["a_psu"] = supply
+        return link.partial_rows + [s]
+    link.partial_snapshot = snapshot
     quiet = SilenceTimer("END_HOLD")
     while True:
         line = link.readline()
@@ -1434,6 +1527,7 @@ def run_kv_hold(link, psu, psu_mod, v_set, dshot, hold_ms, settle_ms=1500):
              summary["thrust_g_mean"],
              "  [supply %.3f V, %.3f A]" % supply if supply else "",
              "  [" + summary["flag_names"] + "]" if summary["flags"] else ""))
+    link.partial_snapshot = None
     return summary
 
 
@@ -1457,10 +1551,19 @@ def run_link_test(link, throttles, hold_ms=2000):
     print("  %-6s %-8s %-9s %-9s %-9s %s"
           % ("thr%", "rpm", "decoded", "corrupt", "silent", "verdict"))
     rows = []
+    link.partial_rows = rows
     for thr in throttles:
         link.write_line("HOLD,%d,%d,1200" % (thr, hold_ms))
         acc = Accumulator()
         stats = None
+        def snapshot():
+            if not acc.rows:
+                return rows
+            s = acc.summarize(link, "linktest", thr, 0)
+            # End-of-hold telemetry counters may never arrive. Leave them
+            # absent rather than inventing a zero error rate for an aborted hold.
+            return rows + [s]
+        link.partial_snapshot = snapshot
         recording = False
         quiet = SilenceTimer("END_HOLD")
         while True:
@@ -1529,6 +1632,7 @@ def run_link_test(link, throttles, hold_ms=2000):
                      "corrupt_pct": round(pct(corrupt), 3),
                      "edt_frames": int((stats or {}).get("edt_frames", 0)),
                      "flags": summary["flags"], "flag_names": summary["flag_names"]})
+        link.partial_snapshot = None
     return rows
 
 
@@ -1559,12 +1663,20 @@ def run_fine_walk(link, values, reps, hold_ms, settle_ms=1200):
     print("  %-6s %-6s %-6s %-9s %-9s %-8s %s"
           % ("visit", "dshot", "pct", "rpm", "period", "n_codes", "volts"))
     rows = []
+    link.partial_rows = rows
     for visit, (value, rep) in enumerate(order):
         link.write_line("DHOLD,%d,%d,%d" % (value, hold_ms, settle_ms))
         acc = Accumulator()
         recording = False
         dshot = value
         pct = 0
+        def snapshot():
+            if not acc.rows:
+                return rows
+            s = acc.summarize(link, "finewalk", pct, dshot)
+            s.update(dshot_set=value, visit=visit, rep=rep)
+            return rows + [s]
+        link.partial_snapshot = snapshot
         quiet = SilenceTimer("END_HOLD")
         while True:
             line = link.readline()
@@ -1593,6 +1705,7 @@ def run_fine_walk(link, values, reps, hold_ms, settle_ms=1200):
         s["visit"] = visit
         s["rep"] = rep
         rows.append(s)
+        link.partial_snapshot = None
         print("  %-6d %-6d %-6s %-9d %-9d %-8d %.4f"
               % (visit, value, s["throttle_pct"], s["rpm_mean"],
                  s["erpm_period_us"], s["n_codes"], s["volts_mean"]))
@@ -2181,7 +2294,7 @@ def watch_idle(link, seconds, interval=5.0):
             print("    came back wrong, so a corrupt thrust sample is a corrupt READ,")
             print("    not a corrupt conversion.")
             # Naming what was already excluded by measurement, so nobody spends
-            # an evening re-excluding it. See BENCH_NOTES.md, 2026-09-01.
+            # an evening re-excluding it.
             print("    On this bench it is the supply: 0.018%% with the ESC")
             print("    disconnected and no current flowing. Already ruled out by")
             print("    measurement -- bus speed, the DRDY pin, the DShot signal wire,")
@@ -2371,10 +2484,7 @@ def run_masscheck_unload(link, masses, descend):
     tol = settling_tolerance(link)
     print("\nLoad cell check, unloading geometry (thrust unloads the cell).")
     print("Removing ballast reproduces thrust: each removal should read POSITIVE.\n")
-    try:
-        input("  Place ALL masses on the motor (%.2f g total), then press Enter: " % total)
-    except (EOFError, KeyboardInterrupt):
-        return []
+    input("  Place ALL masses on the motor (%.2f g total), then press Enter: " % total)
 
     # Tare only once the ballast has come to rest. Taring mid-transient offsets
     # every later point by the same amount, and unlike a slope error that is
@@ -2387,6 +2497,7 @@ def run_masscheck_unload(link, masses, descend):
     print("     tared with %.2f g ballast\n" % total)
 
     points = []
+    link.partial_rows = points
     removed = 0.0
     t0 = time.time()
 
@@ -2425,11 +2536,7 @@ def run_masscheck_unload(link, masses, descend):
         else:
             removed -= m
             prompt = "  Put back %.2f g (cumulative removed %.2f g)" % (m, removed)
-        try:
-            input("%s, then press Enter: " % prompt)
-        except (EOFError, KeyboardInterrupt):
-            print("\n  stopping")
-            break
+        input("%s, then press Enter: " % prompt)
         status = wait_stable(link, tol_counts=tol)
         settled = status == "settled"
         g, sd, n, raw, n_mangled = read_thrust_avg(link)
@@ -2479,15 +2586,12 @@ def run_masscheck(link, masses, descend, expected=1.0):
         sequence += list(reversed(masses[:-1])) + [0.0]
 
     points = []
+    link.partial_rows = points
     t0 = time.time()
     for i, m in enumerate(sequence):
         direction = "down" if descend and i > len(masses) else "up"
         prompt = "  Remove all masses" if m == 0 else "  Apply %.2f g" % m
-        try:
-            input("%s, then press Enter: " % prompt)
-        except (EOFError, KeyboardInterrupt):
-            print("\n  stopping")
-            break
+        input("%s, then press Enter: " % prompt)
         status = wait_stable(link, tol_counts=tol)
         settled = status == "settled"
         g, sd, n, raw, n_mangled = read_thrust_avg(link)
@@ -2514,6 +2618,34 @@ def run_masscheck(link, masses, descend, expected=1.0):
     return points
 
 
+def warn_if_partial(path):
+    """Warn when `path` holds a run that stopped early. True if it did.
+
+    An aborted run keeps the rows it collected, so it stays readable and is
+    worth re-examining. What it is not is a complete protocol: a sweep can be
+    missing its whole down leg, a MASSCHECK half its masses. Anything that
+    fits, rescales or plots one has to say so rather than presenting it as a
+    finished run. Files written before this marker existed report nothing,
+    which is the honest answer for them.
+    """
+    status, reason = None, ""
+    with open(path) as fh:
+        for line in fh:
+            if not line.startswith("#"):
+                break
+            if line.startswith("# result,"):
+                head, _, rest = line[len("# result,"):].strip().partition(",")
+                status = head.partition("=")[2]
+                reason = rest.partition("=")[2]
+    if status != "aborted":
+        return False
+    print("[WARN] %s is a PARTIAL run (%s). It holds only the rows collected "
+          "before the run stopped -- do not read it as a full protocol."
+          % (os.path.basename(path), reason or "no reason recorded"),
+          file=sys.stderr)
+    return True
+
+
 def read_kv_csv(path):
     """Points from a saved KV run, numeric, top DShot level only.
 
@@ -2522,6 +2654,7 @@ def read_kv_csv(path):
     and its V_motor is not the recorded bus voltage, so mixing them in would
     quietly bias every pairing.
     """
+    warn_if_partial(path)
     with open(path) as fh:
         lines = fh.readlines()
     rows = list(csv.DictReader([l for l in lines if not l.startswith("#")]))
@@ -2726,6 +2859,7 @@ def rescale_csv(path, factor):
     the counts the sensor actually produced, and the file records both the old
     and the new factor so the correction is auditable.
     """
+    warn_if_partial(path)
     header, rows, fieldnames = [], [], None
     with open(path) as fh:
         lines = fh.readlines()
@@ -2793,6 +2927,7 @@ def refit_masscheck(path, expected_slope):
     than re-weighing everything. Also useful for re-examining an old run after
     the factor has moved.
     """
+    warn_if_partial(path)
     rows, factor = [], None
     with open(path) as handle:
         for line in handle:
@@ -3058,7 +3193,7 @@ def write_csv(path, rows, fields, link, mode, notes, extra_meta=None):
         # working, which is the difference between a real esc_stress column and
         # a frozen one.
         for key in ("fw", "board", "esc", "scale", "ina", "flags", "phase",
-                    "ambient", "stats"):
+                    "ambient", "stats", "warn", "error"):
             # Multi-valued keys accumulate legitimately (ambient banner/start/end),
             # but an ID reprint re-emits the banner line, so drop exact repeats
             # rather than writing the same reading into the header twice.
@@ -3168,8 +3303,13 @@ def main():
     parser = argparse.ArgumentParser(description="Thrust stand host link (schema 1)")
     modes = ["STATIC", "TRANSIENT", "SWEEP", "RESPONSE", "COASTDOWN", "KV", "MASSCHECK",
              "LINKTEST", "FINEWALK"]
-    parser.add_argument("-m", "--mode", default="SWEEP",
-                        choices=modes + [m.lower() for m in modes])
+    # No default. A default mode turned every mistyped or mode-less invocation
+    # into a full sweep: `measure.py --tare` once tared and then swept, at
+    # whatever direction and supply voltage the bench had been left in.
+    parser.add_argument("-m", "--mode", default=None,
+                        choices=modes + [m.lower() for m in modes],
+                        help="sequence to run. Omit it and nothing spins: "
+                             "--check, --tare and --watch still work on their own")
     parser.add_argument("--codes", action="store_true",
                         help="Print the raw eRPM period each step landed on. The "
                              "resolution of period-based telemetry degrades as RPM^2, "
@@ -3260,10 +3400,21 @@ def main():
                              "record instead")
     parser.add_argument("--edt", action="store_true",
                         help="Ask the ESC for extended telemetry (temperature, stress, "
-                             "status). Off by default: support is an ESC firmware "
-                             "property nothing can read back, and an ESC that never "
-                             "answers puts edt_stale on every row of every run. The "
-                             "esc_* columns stay present and empty when it is off")
+                             "status). The firmware's own default is "
+                             "EDT_REQUEST_DEFAULT in config.h; pass this to force it on "
+                             "for one run. The esc_* columns stay present and empty "
+                             "when it is off, so runs stay column-compatible")
+    parser.add_argument("--no-edt", action="store_true",
+                        help="Do not ask for extended telemetry, overriding the "
+                             "firmware default for one run. Use it on an ESC that never "
+                             "answers: support is an ESC firmware property nothing can "
+                             "read back, and asking an ESC that will not answer puts "
+                             "edt_stale on every row of every run, which is how flags "
+                             "stop being read at all. Not the same as "
+                             "tools/fake_stand.py --no-edt, which emulates an ESC "
+                             "without EDT support rather than declining to ask. "
+                             "Persists until the board reboots or something sends "
+                             "EDT,1, so a later run passing no flag inherits it")
     parser.add_argument("--reverse", action="store_true",
                         help="Declare that the prop was spun against its own design "
                              "direction for this run -- not the ESC's spin direction. "
@@ -3333,15 +3484,36 @@ def main():
                         help="Skip the pre-run tare (default is to re-tare before every run)")
     args = parser.parse_args()
 
+    # Checked before the port is opened, so a typo costs nothing and does not
+    # leave a connected board mid-setup.
+    if args.edt and args.no_edt:
+        parser.error("--edt and --no-edt are contradictory")
+
     # The prop's own frame, independent of which way the ESC was actually
     # told to spin (that is esc_reversed, computed once connected -- see the
     # --prop-hand block below). Computed here, not inside the try block, so
     # it is available even on a path that never reaches that block.
     rotation = "reversed" if args.reverse else "normal"
 
-    mode = args.mode.upper()
+    mode = args.mode.upper() if args.mode else None
     link = None
     rows = []
+    failure = None
+    exit_code = 0
+    capture_started = False
+    # Chosen from the mode, not from the branch that ran, because a run that
+    # fails partway still has to be written out and there is no branch to have
+    # set it. One source, so the two cannot drift apart.
+    fields = {"TRANSIENT": TRANSIENT_FIELDS, "RESPONSE": TRANSIENT_FIELDS,
+              "COASTDOWN": TRANSIENT_FIELDS, "MASSCHECK": MASS_FIELDS,
+              "KV": KV_FIELDS, "LINKTEST": LINK_FIELDS,
+              "FINEWALK": WALK_FIELDS}.get(mode, STEADY_FIELDS)
+
+    if mode is None and not (args.check or args.tare or args.watch > 0
+                             or args.refit or args.rescale or args.kv_pair):
+        parser.error("nothing to do: pass -m MODE to run a sequence, or "
+                     "--check, --tare or --watch for an action that never "
+                     "spins the motor")
 
     if args.kv_pair:
         return report_kv_pair(args.kv_pair[0], args.kv_pair[1])
@@ -3393,7 +3565,7 @@ def main():
         # banner warning and the site's sign check only catch it after the
         # runs already exist. --check is exempt -- it never spins the motor
         # or writes a CSV, so there is nothing for a wrong default to corrupt.
-        if prop_hand is None and not args.check:
+        if prop_hand is None and not args.check and mode is not None:
             sys.exit("esc_dir_forward is not set in stand.json and --prop-hand was "
                       "not passed. This is a one-time, bench-level setting -- set it "
                       "once before a session, not per run. See README.md.")
@@ -3450,8 +3622,13 @@ def main():
         # puts edt=1 in the CSV, so a run with empty esc_* columns says whether
         # it asked. The firmware refuses this mid-sequence, which cannot happen
         # here -- nothing has been triggered yet.
-        if args.edt:
-            link.write_line("EDT,1")
+        # Both directions are sent explicitly. The firmware default moves with
+        # whichever ESC is fitted, so a run that says nothing inherits it; a run
+        # that says something must be able to say either thing, or the default
+        # becomes a reflash.
+        if args.edt or args.no_edt:
+            want = bool(args.edt)
+            link.write_line("EDT,%d" % want)
             time.sleep(0.3)
             link.write_line("ID")
             time.sleep(0.5)
@@ -3461,12 +3638,12 @@ def main():
                 if line and line.startswith("#"):
                     link.absorb_meta(line)
                     if line.startswith("#ERROR,edt"):
-                        sys.exit("firmware rejected EDT,1 (%s)" % line)
-            if not edt_requested(link):
-                print("[WARN] asked for EDT but the banner still reports edt=0",
-                      file=sys.stderr)
+                        sys.exit("firmware rejected EDT,%d (%s)" % (want, line))
+            if edt_requested(link) != want:
+                print("[WARN] asked for EDT,%d but the banner still reports edt=%d"
+                      % (want, not want), file=sys.stderr)
             else:
-                print("--> EDT:      requested")
+                print("--> EDT:      %s" % ("requested" if want else "not requested"))
 
         # esc_dir is derived, not declared: --reverse states the prop's own
         # frame (what rotation= records), prop_hand states which ESC
@@ -3562,6 +3739,22 @@ def main():
                 watch_idle(link, args.watch)
             return
 
+        # No mode means no sequence. --tare and --watch still do their job;
+        # what used to happen here was a sweep nobody asked for.
+        if mode is None:
+            if args.tare:
+                link.write_line("TARE")
+                time.sleep(1.5)
+                print("  (load cell tared)")
+            if args.watch > 0:
+                watch_idle(link, args.watch)
+            return
+
+        link.begin_capture(args.output)
+        capture_started = True
+        link.journal.write("#RUN,mode=%s\n" % mode)
+        link.journal.write("#SETUP,%s,rotation=%s\n" %
+                           (format_setup_meta(setup_entries), rotation))
         link.start_keepalive()
 
         if not args.no_tare:
@@ -3571,15 +3764,12 @@ def main():
         if mode == "TRANSIENT":
             rows = collect_samples(link, "TRANSIENT", "START_TRANSIENT",
                                    "END_TRANSIENT", "transient")
-            fields = TRANSIENT_FIELDS
         elif mode == "RESPONSE":
             rows = collect_samples(link, "RESPONSE,%d,%d,%d" % (args.base, args.high, args.reps),
                                    "START_RESPONSE", "END_RESPONSE", "response")
-            fields = TRANSIENT_FIELDS
         elif mode == "COASTDOWN":
             rows = collect_samples(link, "COASTDOWN,%d" % args.from_throttle,
                                    "START_COASTDOWN", "END_COASTDOWN", "coastdown")
-            fields = TRANSIENT_FIELDS
         elif mode == "MASSCHECK":
             masses = [float(m) for m in args.masses.split(",") if m.strip()]
             if args.ballast:
@@ -3587,7 +3777,6 @@ def main():
             else:
                 expected = -1.0 if args.thrust_unloads else 1.0
                 rows = run_masscheck(link, masses, args.descend, expected)
-            fields = MASS_FIELDS
         elif mode == "KV":
             voltages = [float(v) for v in args.voltages.split(",") if v.strip()]
             # Highest first: the top setpoint is the duty=1 reference the lower
@@ -3601,28 +3790,25 @@ def main():
                       " identified. See --kv-dshots.", file=sys.stderr)
             rows = run_kv(link, voltages, args.hold_ms, args.psu_port, dshots,
                           args.kv_settle_ms)
-            fields = KV_FIELDS
         elif mode == "LINKTEST":
             throttles = [int(t) for t in args.throttles.split(",") if t.strip()]
             rows = run_link_test(link, throttles, args.hold_ms)
-            fields = LINK_FIELDS
         elif mode == "FINEWALK":
             lo, hi, step = (int(v) for v in args.dshot_range.split(","))
             if step < 1 or hi < lo:
                 raise ValueError("--dshot-range needs LO,HI,STEP with HI>=LO, STEP>=1")
             values = list(range(lo, hi + 1, step))
             rows = run_fine_walk(link, values, args.walk_reps, args.hold_ms)
-            fields = WALK_FIELDS
         elif mode == "SWEEP":
             rows = run_sweep(link)
-            fields = STEADY_FIELDS
         else:
             rows = run_static(link)
-            fields = STEADY_FIELDS
 
-    except Exception as exc:
-        print("\n[ERROR] %s" % exc, file=sys.stderr)
-        fields = STEADY_FIELDS
+    except (Exception, KeyboardInterrupt) as exc:
+        failure = ("interrupted" if isinstance(exc, KeyboardInterrupt)
+                   else "%s: %s" % (type(exc).__name__, exc))
+        exit_code = 130 if isinstance(exc, KeyboardInterrupt) else 1
+        print("\n[ERROR] %s" % failure, file=sys.stderr)
     finally:
         print("\nSafety: commanding motor stop.")
         if link is not None:
@@ -3631,12 +3817,29 @@ def main():
                 link.write_line("STOP")
             except Exception:
                 pass
-            link.close()
+            try:
+                link.close()
+            except Exception as exc:
+                failure = failure or "close failed: %s" % exc
+                exit_code = exit_code or 1
 
-    if not rows:
-        return
+    if not capture_started:
+        return exit_code
+    if failure:
+        try:
+            rows = link.recovered_rows()
+        except Exception as exc:
+            print("[WARN] Could not summarize partial data: %s; raw capture retained."
+                  % exc, file=sys.stderr)
+            rows = link.partial_rows
+    elif not rows:
+        failure = "no measurement rows collected"
+        exit_code = 1
 
-    extra_meta = {}
+    extra_meta = {"result": "status=%s,reason=%s" % (
+        "aborted" if failure else "complete",
+        (failure or "completed").replace("\n", " ").replace("\r", " ").replace(",", ";")),
+        "raw_capture": "file=" + os.path.basename(link.journal_path)}
     # Declared setup goes in ahead of the measured conditions. `setup_entries`
     # is bound in the try block above, which every path reaching here has run.
     # rotation is folded in unconditionally -- unlike the other four setup
@@ -3647,6 +3850,11 @@ def main():
     setup_line = format_setup_meta(setup_entries)
     rotation_field = "rotation=%s" % rotation
     extra_meta["setup"] = (setup_line + "," + rotation_field) if setup_line else rotation_field
+
+    # Ambient applies to a partial run too. The rows it did collect are real
+    # measurements, and density is the one correction that cannot be applied
+    # afterwards -- withholding it from an aborted run would leave the samples
+    # saved but not comparable, which is half a rescue.
     conditions = link.conditions(args.temp_c, args.pressure_hpa)
     if conditions:
         temp_c, press_pa, source = conditions
@@ -3662,6 +3870,17 @@ def main():
         print("       Thrust is proportional to air density, so without this the run")
         print("       cannot be compared against one taken on another day or bench.")
         print("       This is not recoverable after the fact -- re-run with ambient.")
+
+    if failure:
+        # Save before analysis: partial protocols must never update calibration
+        # or produce an apparently complete fit/report.
+        if mode == "RESPONSE":
+            extra_meta["response"] = "base=%d,high=%d,reps=%d" % (
+                args.base, args.high, args.reps)
+        write_csv(args.output, rows, fields, link, mode, args.notes, extra_meta)
+        print("Incomplete run; raw samples retained in %s" % link.journal_path,
+              file=sys.stderr)
+        return exit_code
 
     if mode == "MASSCHECK":
         # The factor in force comes from stand.json, not the firmware banner.
