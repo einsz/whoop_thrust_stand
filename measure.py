@@ -3006,10 +3006,13 @@ def fit_masscheck(points, current_factor, expected_slope=1.0):
         return None
     suggested = counts_per_g / expected_slope
 
-    # Re-express every reading in grams under the factor just derived, so the
-    # quality figures mean something even when the run started uncalibrated.
-    for p in pts:
-        p["reading_g"] = p["reading_raw"] / suggested
+    # Quality figures in grams must be expressed under the factor just derived
+    # -- that is what makes linearity/hysteresis/drift meaningful on a first
+    # calibration -- but the caller's points are not to be touched. The saved
+    # CSV's reading_g column must stay under the factor its own
+    # `# calibration,hx711_scale=` header declares, or the file contradicts
+    # itself. Fit on a re-expressed copy instead.
+    pts = [dict(p, reading_g=p["reading_raw"] / suggested) for p in pts]
     n = len(pts)
     sx = sum(p["mass_g"] for p in pts)
     sy = sum(p["reading_g"] for p in pts)
@@ -3901,8 +3904,19 @@ def main():
             expected = 1.0   # removing ballast reads positive
         fit = fit_masscheck(rows, factor, expected)
         if fit:
-            extra_meta["mass_fit"] = ("slope=%.5f,offset_g=%.4f,max_resid_g=%.4f"
-                                      % (fit["slope"], fit["offset_g"], fit["max_resid_g"]))
+            # slope is computed under the factor this run derived, so it reports
+            # linearity, not agreement with the stored factor -- the agreement
+            # lives in scale_error, and both belong in the file, because the
+            # run's console output is not preserved with the CSV.
+            mass_parts = ["slope=%.5f" % fit["slope"],
+                          "offset_g=%.4f" % fit["offset_g"],
+                          "max_resid_g=%.4f" % fit["max_resid_g"],
+                          "linearity_pct_fs=%.3f" % fit["linearity_pct_fs"],
+                          "suggested_factor=%.4f" % fit["suggested_factor"]]
+            if fit.get("current_factor"):
+                mass_parts += ["current_factor=%.4f" % fit["current_factor"],
+                               "scale_error=%+.4f" % fit["scale_error"]]
+            extra_meta["mass_fit"] = ",".join(mass_parts)
         write_csv(args.output, rows, fields, link, mode, args.notes, extra_meta)
         report_masscheck(rows, fit)
         bad = [p for p in rows if not p.get("settled", 1)]
