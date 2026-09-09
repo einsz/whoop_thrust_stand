@@ -326,9 +326,10 @@ the build above.
   BME280 is a drop-in swap that adds humidity. The gain is minor: over any
   realistic indoor range humidity moves air density only ~0.35%, against ~2% for
   a few degrees of temperature and ~3% for ordinary weather.
-- **A higher-current or faster ESC.** The reference XSD 7A caps speed at roughly
-  81 kRPM and current at 7 A, which sets the fastest motor and largest prop the
-  stand can test.
+- **A higher-current or faster ESC.** The earlier reference XSD 7A capped speed
+  at roughly 81 kRPM and current at 7 A, which set the fastest motor and largest
+  prop that stand could test. The current AM32 20 A reference is not limited
+  there (see bench notes on the supply-limit vs motor-limit distinction).
 - **MLX90640 thermal imager.** Aimed at the motor bell it would show heat
   soaking directly and could log temperatures with the telemetry.
 
@@ -356,10 +357,11 @@ motor stopped. What to look for:
   That one is electrical: grounding, twist, routing, length.
 - **Zero trend under ~0.1 g projected over a session.** A creeping zero is a
   mounting problem, and no calibration corrects it.
-- **`EDT frames` non-zero**, if you want the ESC's own telemetry at all. It is
-  off unless you pass `--edt`; without that the line reads `not requested`, which
-  is a setting rather than a fault. Asked for and still zero means the ESC does
-  not support it or has stopped sending.
+- **`EDT frames` non-zero**, if you want the ESC's own telemetry at all. The
+  reference build asks for it by default (`EDT_REQUEST_DEFAULT 1`, banner shows
+  `edt=1`); if your build or ESC does not answer, pass `--no-edt` and the line
+  reads `not requested`, which is a setting rather than a fault. Asked for and
+  still zero means the ESC does not support it or has stopped sending.
 
 ## Safety
 

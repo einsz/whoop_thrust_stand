@@ -86,10 +86,15 @@ core. With `arduino-cli`:
 
 ```bash
 arduino-cli core install rp2040:rp2040
-arduino-cli lib install "HX711 Arduino Library" "INA2xx" "Adafruit BMP280 Library"
-# ...or, if you fitted a NAU7802 instead of an HX711:
-arduino-cli lib install "Adafruit NAU7802 Library"
+arduino-cli lib install "Adafruit NAU7802 Library" "INA2xx" "Adafruit BMP280 Library"
+arduino-cli lib install "HX711 Arduino Library"   # only needed for an HX711 build
 ```
+
+The shipped `config.h` defaults to the **NAU7802** (`LOADCELL_NAU7802 1` in
+`firmware/config.h`), so the Adafruit NAU7802 library is the one the default
+build needs. Install the library matching the part you actually fit, and change
+that `#define` if you fit the other one -- a build compiled for the NAU7802
+will not convert on HX711 wiring, and vice versa.
 
 That pulls in `Adafruit BusIO` and `Adafruit Unified Sensor` as dependencies.
 `Pico_Bidir_DShot` is installed from source:
@@ -101,8 +106,8 @@ git clone https://github.com/bastian2001/pico-bidir-dshot \
 
 | library | source |
 |---|---|
-| HX711 Arduino Library | <https://github.com/bogde/HX711> |
-| Adafruit NAU7802 Library *(alternative to the HX711)* | <https://github.com/adafruit/Adafruit_NAU7802> |
+| Adafruit NAU7802 Library *(the default build)* | <https://github.com/adafruit/Adafruit_NAU7802> |
+| HX711 Arduino Library *(alternative to the NAU7802)* | <https://github.com/bogde/HX711> |
 | INA2xx | <https://github.com/Zanduino/INA> |
 | Adafruit BMP280 Library | <https://github.com/adafruit/Adafruit_BMP280_Library> |
 | Pico_Bidir_DShot | <https://github.com/bastian2001/pico-bidir-dshot> |
@@ -128,13 +133,15 @@ double-checking is `INA_SHUNT_UOHM`. It must match the shunt actually fitted,
 and a wrong one scales every current and efficiency figure without ever looking
 wrong.
 
-The load cell factor in `stand.json` is written for you by `MASSCHECK`. Five
-fields in it are declarations you have to keep honest yourself:
+The load cell factor in `stand.json` is written for you by `MASSCHECK`, and the
+pole count is set with `POLES`/`--poles`. Five other fields in it are
+declarations you have to keep honest yourself (the two that follow them in the
+example -- `hx711_scale` and `motor_poles` -- are not declarations):
 
 ```json
 {
   "esc_firmware": "AM32 2.21",
-  "esc_pwm_khz": 48,
+  "esc_pwm_khz": 96,
   "hx711_scale": -17669.5711,
   "motor_poles": 12,
   "psu": "Kiprim DC310S",
@@ -149,7 +156,9 @@ one run. None of them can be read back over DShot, which carries no firmware
 version at all, and **a patched Bluejay reports the same version string as a
 stock one**. That is why `measure.py` echoes all five before the motor spins,
 and warns about any that are unset. A blank field is recoverable from your
-notes; a confidently wrong one is not.
+notes; a confidently wrong one is not. (On the AM32 fitted to the reference
+build, `esc_pwm_khz` is only meaningful alongside the `variable_pwm` setting
+read back by `tools/am32.py`: setting 2 overrides the base frequency.)
 
 On an ARM ESC (AM32, BLHeli_32) you can do better than declaring them.
 `tools/am32.py` reads the firmware version and the whole settings page back off
@@ -410,7 +419,9 @@ check for a full protocol end to end.
 **Whether the stand asks for EDT is a setting, not a fixed answer**, because
 whether an ESC replies is a property of its firmware. `EDT_REQUEST_DEFAULT` in
 `firmware/config.h` sets what a build does, and `measure.py --edt` and
-`--no-edt` override it for one run without a reflash. Asked, the firmware sends
+`--no-edt` override it without a reflash. The override is sticky on the board:
+it persists until the opposite flag or a reboot, so a run that says nothing
+inherits whatever the last explicit setting was. Asked, the firmware sends
 DShot command 13 at boot and at every sequence start, and the banner records
 `edt=1` so a run says whether it asked.
 
@@ -434,8 +445,9 @@ temperature and stress frame to the link error rate.
 **Treat whatever arrives as opportunistic.** Support varies widely between ESC
 firmwares: fields may never be sent, may report implausible values, and the
 whole channel may stop once the motor arms. All EDT types also share one budget
-of a few frames per second against 250 printed rows/s, which is far too sparse
-to attribute anything to a particular throttle step.
+of a few frames per second against roughly 250-670 printed rows/s (depending on
+the fitted ADC), which is far too sparse to attribute anything to a particular
+throttle step.
 
 Everything is plumbed so those cases are *visible* rather than silently frozen.
 The `esc_*` columns carry `n_edt`/`edt_age_us` and are deduplicated like every
@@ -477,10 +489,11 @@ that is quietly wrong, producing smooth, plausible, useless data.
    per step; `rpm_per_us` in every steady-state row is the finest change the
    telemetry could have expressed there. Read any plateau against that number
    before believing it.
-2. **Per-channel sequence counters.** Rows print at 250 Hz while the HX711
-   converts at 80 Hz and the INA at 100 Hz, so the host deduplicates on these
-   counters. Averaging printed rows would count each physical reading 2–3× and
-   deflate the standard deviation by roughly √3.
+2. **Per-channel sequence counters.** Rows print faster than the sensors
+   convert (250 Hz against the HX711's 80 Hz and the INA's 100 Hz; ~670 Hz
+   against the NAU7802's 320 SPS), so the host deduplicates on these counters.
+   Averaging printed rows would count each physical reading 2–3× and deflate
+   the standard deviation by roughly √3.
 3. **Saturation and staleness are flagged in firmware**, per sample, rather than
    left for a human to notice later. A flag marks the sample it belongs to and
    nothing else. `esc_alert` is cleared as soon as it is printed: latching it
@@ -499,8 +512,9 @@ that is quietly wrong, producing smooth, plausible, useless data.
    failures into `corrupt` (the ESC answered and the answer arrived damaged:
    electrical, worth chasing) and `silent` (it did not answer: the ESC's own
    scheduling). It then compares what survives against the print rate. Frames
-   are polled at a few kHz while rows print at 250 Hz, so even a large loss
-   percentage often costs no samples at all.
+   are polled at a few kHz while rows print at ~250-670 Hz depending on
+   the fitted ADC, so even a large loss percentage often costs no
+   samples at all.
 
 ---
 

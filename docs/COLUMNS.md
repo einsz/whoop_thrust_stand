@@ -7,8 +7,9 @@ others. This file is the reference for both.
 
 The header carries everything needed to interpret the file on its own:
 
-- the firmware banner: `#FW`, `#BOARD`, `#ESC`, `#SCALE`, `#INA`, `#FLAGS`,
-  `#PHASE`, `#COLS`
+- the firmware banner: `#SCHEMA`, `#FW`, `#BOARD`, `#ESC`, `#SCALE`, `#INA`,
+  `#FLAGS`, `#PHASE`, `#COLS`
+- the run itself: `# run`, `# notes` (when given)
 - the ambient conditions: `#AMBIENT`
 - the calibration factor: `# calibration`
 - the declared setup, run rotation and (when given) the specimen: `# setup`
@@ -117,12 +118,14 @@ construction.
 
 ## Reading a summary row
 
-Rows print faster than the sensors convert, 250 Hz against the HX711's 80 SPS
-and the INA's 100 SPS, so **summary columns are computed over distinct physical
-readings, not printed rows**. The host deduplicates on the sequence counters
-(`n_rpm`, `n_thrust`, `n_ina`, `n_edt`); means and standard deviations are over
-real samples, and the `n_*` counts show how many stand behind each.
-`rows_printed` is the printed row count and is *not* the sample support.
+Rows print faster than the sensors convert (250 Hz against the HX711's 80 SPS
+on that build; ~670 Hz against the NAU7802's 320 SPS on the current default),
+and the INA converts at 100 SPS, so **summary columns are computed over
+distinct physical readings, not printed rows**. The host deduplicates on the
+sequence counters (`n_rpm`, `n_thrust`, `n_ina`, `n_edt`); means and standard
+deviations are over real samples, and the `n_*` counts show how many stand
+behind each. `rows_printed` is the printed row count and is *not* the sample
+support.
 
 Two counts describe what went wrong at the edges of that scheme, and they mean
 opposite things:
@@ -194,9 +197,10 @@ collapsed into one summary).
 ## Transient set
 
 `TRANSIENT`, `RESPONSE` and `COASTDOWN`. One row per printed sample. The
-`new_*` columns are the dedup markers: rows print at 250 Hz while the sensors
-convert slower, so consecutive rows repeat the same reading. A `new_` of 0 means
-"this row repeats the previous value".
+`new_*` columns are the dedup markers: rows print faster than the sensors
+convert (250 Hz against 80/100 SPS on the HX711 build), so consecutive rows
+repeat the same reading. A `new_` of 0 means "this row repeats the previous
+value".
 
 A `RESPONSE` run's header additionally carries `# response,base=B,high=H,reps=N`,
 with the throttles and repeat count actually commanded (`--base`/`--high`/

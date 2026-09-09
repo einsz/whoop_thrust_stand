@@ -45,23 +45,22 @@ const uint ESC_PIN    = 15;    // GPIO number, not header pin number
 const int  DSHOT_RATE = 600;   // 150 / 300 / 600 / 1200
 
 // Extended DShot Telemetry (temperature, voltage, current, stress, status
-// frames interleaved with the eRPM ones), off by default.
+// frames interleaved with the eRPM ones).
 //
-// It is off because support is an ESC-firmware property that nothing can read
-// back, and a channel that never answers is worse than no channel: edt_stale
-// lands on every row of every run, and a flag that is always set is a flag
-// nobody reads. On the ESC this stand was developed against, EDT stops once
-// the motor has armed and no amount of re-requesting revives it.
-//
-// Turn it on if your ESC supports it properly -- esc_stress is a genuine
-// desync canary when it works. Both directions have a runtime override that
-// needs no reflash: `measure.py --edt` forces it on, `--no-edt` forces it off.
+// Whether the ESC answers is an ESC-firmware property nothing can read back,
+// and a channel that never answers is worse than no channel: edt_stale lands
+// on every row of every run, and a flag that is always set is a flag nobody
+// reads. esc_stress is a genuine desync canary when the ESC does answer, and
+// this build's fitted ESC answers -- hence the default of 1 below.
 //
 // **Default changed from 0 to 1 on 2026-09-06**, when the fitted ESC changed to
 // one that answers. The old default was set against a Bluejay build that stops
 // sending EDT once it arms, where asking gained nothing and put edt_stale on
 // every row. If your ESC is like that, set this back to 0 or pass --no-edt:
 // flags nobody can trust are worse than no flags.
+//
+// Both directions have a runtime override that needs no reflash:
+// `measure.py --edt` forces it on, `--no-edt` forces it off.
 //
 // This only controls whether the stand *asks* for EDT. Frames are always
 // decoded if they arrive: they are valid telemetry, and treating them as
@@ -173,14 +172,16 @@ const int I2C_SCL_PIN = 5;
 // See docs/HARDWARE.md before buying a breakout.
 const uint32_t INA_SHUNT_UOHM = 10000;
 
-// Full-scale current. Two independent ceilings apply and are best kept aligned
-// so there is only one number to reason about:
+// Full-scale current. Two independent ceilings apply and they are NOT the same
+// number:
 //   - Analog: the chip's shunt full scale (INA_SHUNT_FS_UV below) divided by
 //     the shunt resistance. At +-81.92 mV across 10 mOhm that is 8.19 A.
 //   - Digital: the library derives current_LSB = INA_MAX_AMPS / 32767, so the
-//     current register saturates here.
-// Set INA_MAX_AMPS at or just below the analog ceiling. Raising it costs
-// resolution only once the LSB exceeds what the shunt ADC can resolve.
+//     current register saturates at INA_MAX_AMPS. With 8 here the effective
+//     full scale is 8.0 A -- just under the 8.19 A analog figure, so the
+//     digital ceiling binds first and 8.0 A is the number to reason about.
+// Keep the two close: raising INA_MAX_AMPS well above the analog ceiling would
+// report currents beyond what the shunt ADC can resolve.
 const uint16_t INA_MAX_AMPS = 8;
 
 // Shunt ADC full scale, a fixed property of the chip. INA226/INA231: 81920 uV.
