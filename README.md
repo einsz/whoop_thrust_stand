@@ -134,9 +134,9 @@ and a wrong one scales every current and efficiency figure without ever looking
 wrong.
 
 The load cell factor in `stand.json` is written for you by `MASSCHECK`, and the
-pole count is set with `POLES`/`--poles`. Five other fields in it are
-declarations you have to keep honest yourself (the two that follow them in the
-example -- `hx711_scale` and `motor_poles` -- are not declarations):
+pole count is set with `POLES`/`--poles`. Those two fields, `hx711_scale` and
+`motor_poles`, are measured rather than declared. The other five in the example
+below are declarations you have to keep honest yourself:
 
 ```json
 {
@@ -445,7 +445,7 @@ temperature and stress frame to the link error rate.
 **Treat whatever arrives as opportunistic.** Support varies widely between ESC
 firmwares: fields may never be sent, may report implausible values, and the
 whole channel may stop once the motor arms. All EDT types also share one budget
-of a few frames per second against roughly 250-670 printed rows/s (depending on
+of a few frames per second against roughly 250-590 printed rows/s (depending on
 the fitted ADC), which is far too sparse to attribute anything to a particular
 throttle step.
 
@@ -490,7 +490,7 @@ that is quietly wrong, producing smooth, plausible, useless data.
    telemetry could have expressed there. Read any plateau against that number
    before believing it.
 2. **Per-channel sequence counters.** Rows print faster than the sensors
-   convert (250 Hz against the HX711's 80 Hz and the INA's 100 Hz; ~670 Hz
+   convert (250 Hz against the HX711's 80 Hz and the INA's 100 Hz; ~590 Hz
    against the NAU7802's 320 SPS), so the host deduplicates on these counters.
    Averaging printed rows would count each physical reading 2–3× and deflate
    the standard deviation by roughly √3.
@@ -512,7 +512,7 @@ that is quietly wrong, producing smooth, plausible, useless data.
    failures into `corrupt` (the ESC answered and the answer arrived damaged:
    electrical, worth chasing) and `silent` (it did not answer: the ESC's own
    scheduling). It then compares what survives against the print rate. Frames
-   are polled at a few kHz while rows print at ~250-670 Hz depending on
+   are polled at a few kHz while rows print at ~250-590 Hz depending on
    the fitted ADC, so even a large loss percentage often costs no
    samples at all.
 

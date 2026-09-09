@@ -18,8 +18,9 @@ The header carries everything needed to interpret the file on its own:
   `# raw_capture`
 
 `RESPONSE` runs additionally carry the commanded step levels as
-`# response,base=..,high=..,reps=..`. `plot_comparison.py` reads columns by
-name and refuses any file with a schema other than 1.
+`# response,base=..,high=..,reps=..`, and `MASSCHECK` runs carry the fit as
+`# mass_fit` (see [Mass-check set](#mass-check-set)). `plot_comparison.py`
+reads columns by name and refuses any file with a schema other than 1.
 
 **Rotation and spin direction are two different fields; a consumer should not
 read `dir=` for rotation.** `# setup,rotation=normal|reversed` is the only
@@ -119,8 +120,8 @@ construction.
 ## Reading a summary row
 
 Rows print faster than the sensors convert (250 Hz against the HX711's 80 SPS
-on that build; ~670 Hz against the NAU7802's 320 SPS on the current default),
-and the INA converts at 100 SPS, so **summary columns are computed over
+on that build; ~590 Hz measured against the NAU7802's 320 SPS on the current
+default), and the INA converts at 100 SPS, so **summary columns are computed over
 distinct physical readings, not printed rows**. The host deduplicates on the
 sequence counters (`n_rpm`, `n_thrust`, `n_ina`, `n_edt`); means and standard
 deviations are over real samples, and the `n_*` counts show how many stand
@@ -294,8 +295,30 @@ second axis of the fit; `v_set` is the commanded supply voltage.
 | `reading_raw` | the cell's settled reading in raw counts |
 | `reading_sd_g` | standard deviation of the settled readings |
 | `n` | number of samples |
+| `n_mangled` | conversions rejected as corrupt transfers before the mean |
 | `direction` | `up` or `down` |
 | `settled` | 1 if the point settled within tolerance |
+| `settle_status` | `settled`, or why it gave up: `drifting` or `noisy` |
+
+A mass check's header also carries `# mass_fit` with the fit itself:
+
+| field | meaning |
+|---|---|
+| `slope` | grams read per gram applied, fitted through the run's measured zero |
+| `offset_g` | intercept in grams of the free (not through-zero) fit |
+| `max_resid_g` | worst residual of the through-zero fit, in grams |
+| `linearity_pct_fs` | that residual as a percentage of full scale |
+| `suggested_factor` | the counts-per-gram factor this run derived |
+| `current_factor` | the factor that was in force, when there was one |
+| `scale_error` | `suggested_factor / current_factor - 1` |
+
+**`scale_error` is the agreement figure; `slope` is not.** The grams in
+`reading_g` are computed under the factor `# calibration,hx711_scale=` declares,
+but the fit is done on a copy re-expressed under `suggested_factor`. So `slope`
+reports how linear the cell is, and lands near 1 even on a cell reading 3% high.
+Whether the stored factor is still right lives in `scale_error` alone. The first
+calibration of a stand has no factor in force, so it writes neither
+`current_factor` nor `scale_error`.
 
 ## Flags
 

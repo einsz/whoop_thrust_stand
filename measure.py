@@ -67,20 +67,34 @@ SCHEMA_VERSION = 1
 PRINT_FAST_US = 4000
 
 
-def rows_per_second(link):
-    """Printed rows/s for the fitted part, mirroring firmware's PRINT_FAST_US.
+# Rows actually printed per second, per fitted part. The firmware compiles a
+# different in-sequence print period per load cell (#if LOADCELL_NAU7802 in
+# firmware.ino: 1500 us against 4000 us) and announces the part in #SCALE.
+#
+# These are achieved rates where one has been measured, not nominal ones. The
+# loop also polls serial, services sensors and feeds the watchdog -- ~357 us of
+# overhead on 2026-09-02 -- so 1500 us achieved 593 Hz, not the nominal 667.
+# The HX711 build has no measured figure, so it keeps its nominal 250 Hz;
+# quoting a rate above the achieved one only understates headroom, which is the
+# safe direction for every check here.
+ROWS_PER_SECOND = {
+    "nau7802": 593.0,                  # 1500 us, measured 2026-09-02
+    "hx711": 1e6 / PRINT_FAST_US,      # 4000 us nominal; not measured
+}
 
-    The firmware compiles a different in-sequence print period per load-cell
-    part (#if LOADCELL_NAU7802 in firmware.ino: 1500 us ~= 667 Hz nominal,
-    4000 us = 250 Hz), and its boot banner announces the part in #SCALE. A host
-    check that compares against the wrong row rate -- e.g. link-test headroom --
-    is off by the 667/250 ratio on the NAU7802 build.
+
+def rows_per_second(link):
+    """Printed rows/s for the part named in the #SCALE banner.
+
+    A check that compares against the wrong part's row rate is out by the
+    ratio between them: link-test headroom read 2.4x high on the NAU7802 build
+    while this was a single constant.
     """
     scale = (link.meta.get("scale") or [""])[-1]
     part = scale.split(",", 1)[0]
-    if part == "nau7802":
-        return 1e6 / 1500.0
-    return 1e6 / PRINT_FAST_US   # hx711, or a pre-#SCALE session
+    # An unknown or pre-#SCALE part falls back to the HX711 rate, the slower of
+    # the two, so the fallback cannot flatter a link.
+    return ROWS_PER_SECOND.get(part, ROWS_PER_SECOND["hx711"])
 
 # Per-sample flag bits, matching FLAG_* in firmware.ino. The firmware computes
 # them per printed row; the host decides what they mean at aggregate level.
@@ -1095,8 +1109,8 @@ def report_missed_samples(rows):
         "  jitter, and the nominal rate is not the achieved one: the loop also\n"
         "  polls serial, services sensors and feeds the watchdog, which measured\n"
         "  ~357 us of overhead on 2026-09-02.\n"
-        "  PRINT_FAST_US is 1500 us for the NAU7802, ~540 rows/s achieved, a\n"
-        "  margin of ~1.7x over 320 SPS. Seeing this warning at 320 SPS means\n"
+        "  PRINT_FAST_US is 1500 us for the NAU7802, 593 rows/s achieved, a\n"
+        "  margin of 1.82x over 320 SPS. Seeing this warning at 320 SPS means\n"
         "  something has eaten that margin -- check rows_dropped in #STATS and\n"
         "  whether anything new runs in the loop.\n"
         "  Otherwise: shorten PRINT_FAST_US again, or lower the rate with --sps.")

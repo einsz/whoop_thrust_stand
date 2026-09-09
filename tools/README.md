@@ -527,6 +527,41 @@ known-bad ones report several.
 
 ---
 
+### `block_compare.py`
+
+Plots one block of repeated sweeps against another and puts the ratio in its
+own panel.
+
+    block_compare.py "A=data/branchbase_[0-9]_*.csv" "B=data/motorb_[0-9]_*.csv"
+
+`plot_comparison.py` answers whether a curve has the right shape. This answers
+how two sets of runs differ, which is a different job and needs a different
+figure: sixteen overlaid traces that differ by two percent are unreadable, and
+the same two percent is obvious as a ratio.
+
+**The ratio panel is the tool.** Motor A's 66% throttle step was invisible in
+the overlaid curves and in a matched-RPM table, and unmissable as a ratio.
+
+Two or three blocks, with ratios taken against the first, so name the reference
+block first. The per-step panel marks every throttle step deviating 35% or more
+from its local trend, which is where PWM entrainment locks show up; the trace
+behind it is context, the dots are the finding.
+
+**A fourth block needs a hue that passes the colour-vision check**, not the next
+one that looks different. The obvious green fails deuteranopia separation
+against the orange already in use.
+
+Current against RPM is plotted because the load cell is not in that path, so
+two blocks taken at different scale factors, which any pair either side of a
+mount swap will be, can still be compared honestly. Power against thrust is
+plotted for what the setup delivers, calibration included.
+
+Steps at or above `--amp-limit` are dropped as supply-limited and the excluded
+fraction is printed. A current-limited top end is a property of the supply, and
+the lossier motor sags the rail further and reads as if it were weaker.
+
+---
+
 ## ESC firmware
 
 ### `patch_bluejay_debug.py`
@@ -636,37 +671,3 @@ script. That cost an evening once.
 
 Builds go to a directory under the system temp dir, so nothing lands in the
 repository. `--build-dir` overrides it.
-
-
-## block_compare.py
-
-Plots one block of repeated sweeps against another and puts the ratio in its
-own panel.
-
-    block_compare.py "A=data/branchbase_[0-9]_*.csv" "B=data/motorb_[0-9]_*.csv"
-
-`plot_comparison.py` answers whether a curve has the right shape. This answers
-how two sets of runs differ, which is a different job and needs a different
-figure: sixteen overlaid traces that differ by two percent are unreadable, and
-the same two percent is obvious as a ratio.
-
-**The ratio panel is the tool.** Motor A's 66% throttle step was invisible in
-the overlaid curves and in a matched-RPM table, and unmissable as a ratio.
-
-Two or three blocks, with ratios taken against the first, so name the reference
-block first. The per-step panel marks every throttle step deviating 35% or more
-from its local trend, which is where PWM entrainment locks show up; the trace
-behind it is context, the dots are the finding.
-
-**A fourth block needs a hue that passes the colour-vision check**, not the next
-one that looks different. The obvious green fails deuteranopia separation
-against the orange already in use.
-
-Current against RPM is plotted because the load cell is not in that path, so
-two blocks taken at different scale factors, which any pair either side of a
-mount swap will be, can still be compared honestly. Power against thrust is
-plotted for what the setup delivers, calibration included.
-
-Steps at or above `--amp-limit` are dropped as supply-limited and the excluded
-fraction is printed. A current-limited top end is a property of the supply, and
-the lossier motor sags the rail further and reads as if it were weaker.
