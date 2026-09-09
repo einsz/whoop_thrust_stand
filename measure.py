@@ -58,10 +58,29 @@ import tempfile
 import serial
 
 SCHEMA_VERSION = 1
-# Firmware's in-sequence print period; must match PRINT_FAST_US in firmware.ino.
-# Rows per second is the real ceiling on samples per step, which is what makes
-# a telemetry loss percentage meaningful or irrelevant.
+# Firmware's in-sequence print period on the HX711 build; must match
+# PRINT_FAST_US in firmware.ino. That constant is per fitted part -- 1500 us on
+# the NAU7802 build, 4000 us on the HX711 -- so the host cannot hold one value:
+# use rows_per_second(), which reads the part off the #SCALE banner, wherever a
+# row rate matters. Rows per second is the real ceiling on samples per step,
+# which is what makes a telemetry loss percentage meaningful or irrelevant.
 PRINT_FAST_US = 4000
+
+
+def rows_per_second(link):
+    """Printed rows/s for the fitted part, mirroring firmware's PRINT_FAST_US.
+
+    The firmware compiles a different in-sequence print period per load-cell
+    part (#if LOADCELL_NAU7802 in firmware.ino: 1500 us ~= 667 Hz nominal,
+    4000 us = 250 Hz), and its boot banner announces the part in #SCALE. A host
+    check that compares against the wrong row rate -- e.g. link-test headroom --
+    is off by the 667/250 ratio on the NAU7802 build.
+    """
+    scale = (link.meta.get("scale") or [""])[-1]
+    part = scale.split(",", 1)[0]
+    if part == "nau7802":
+        return 1e6 / 1500.0
+    return 1e6 / PRINT_FAST_US   # hx711, or a pre-#SCALE session
 
 # Per-sample flag bits, matching FLAG_* in firmware.ino. The firmware computes
 # them per printed row; the host decides what they mean at aggregate level.
@@ -102,7 +121,17 @@ def load_stand_config():
     try:
         with open(STAND_CONFIG) as fh:
             return json.load(fh)
-    except (OSError, ValueError):
+    except OSError:
+        # No file yet: a normal first run. The first MASSCHECK creates it.
+        return {}
+    except ValueError as exc:
+        # The file exists but is not valid JSON. Returning {} silently would
+        # drop calibration and pole count and let a session run uncalibrated --
+        # thrust reads 0, every ratio is wrong, and the run is wasted.
+        print("[WARN] %s is not valid JSON (%s); ignoring it. Fix or remove the"
+              % (STAND_CONFIG, exc), file=sys.stderr)
+        print("       file before calibrating -- a MASSCHECK will overwrite it.",
+              file=sys.stderr)
         return {}
 
 
@@ -627,8 +656,12 @@ class Accumulator:
         self.ina = {}      # n_ina    -> (mV, uA)
         self.rpm = {}      # n_rpm    -> rpm
         self.rpm_raw = {}  # n_rpm    -> raw 12-bit eRPM word
-        self.edt = {}      # n_edt    -> (temp_c, stress)
-        self.edt_age_min = None
+        self.edt = {}          # n_edt    -> (temp_c, stress)
+        # Age of the newest EDT frame on the LAST row of the step. Freshness is
+        # judged from the step's end, not from its start: one frame that lands
+        # early in a long hold must not certify esc_* as fresh for the rest of
+        # the step after the ESC has gone silent.
+        self.edt_age_last = None
         self.flags = 0
         self.rows = 0
         # A stale row is a re-print of a sample already counted fresh, so it
@@ -669,9 +702,12 @@ class Accumulator:
         # rows reports one sample once per step for the length of the run.
         if "n_edt" in row:
             self.edt[row["n_edt"]] = (row.get("esc_temp_c", 0), row.get("esc_stress", 0))
+            # Rows arrive in print order and edt_age_us grows between frames
+            # (it is the age of the newest frame at print time), so the last
+            # row's age is the newest frame's distance from the step's end.
             age = row.get("edt_age_us")
-            if age is not None and (self.edt_age_min is None or age < self.edt_age_min):
-                self.edt_age_min = age
+            if age is not None:
+                self.edt_age_last = age
 
     @staticmethod
     def _stats(values):
@@ -731,6 +767,9 @@ class Accumulator:
         # values look identical to fresh ones in the row, and once an ESC stops
         # sending EDT they stay frozen for the rest of the run -- every step then
         # claims the same stress reading as if it had been measured.
+        # Freshness uses the newest frame's age at the step's end (edt_age_last),
+        # so a channel that dies part-way through a hold is not certified fresh
+        # for the rows that follow the death.
         # What the ESC actually sent this step, before it became an RPM. A mean
         # over 25 samples can sit anywhere between two codes, so a step whose
         # samples all landed on one code has a mean that could not have moved --
@@ -744,7 +783,7 @@ class Accumulator:
         # near the top of a sweep before the step means anything.
         rpm_per_us = round(rpm_m / period, 1) if period else 0.0
 
-        fresh = self.edt_age_min is not None and self.edt_age_min < EDT_FRESH_US
+        fresh = self.edt_age_last is not None and self.edt_age_last < EDT_FRESH_US
         temp_max = max((t for t, _ in self.edt.values()), default=None) if fresh else None
         stress_max = max((s for _, s in self.edt.values()), default=None) if fresh else None
 
@@ -1786,7 +1825,7 @@ def report_fine_walk(rows):
           "repeatability\n  of a single hold, and any real step has to exceed it.")
 
 
-def report_link_test(rows, hold_ms=1000):
+def report_link_test(link, rows, hold_ms=1000):
     usable = [r for r in rows if r["rpm_mean"] > 0]
     if len(usable) < 2:
         return
@@ -1795,13 +1834,15 @@ def report_link_test(rows, hold_ms=1000):
     print("\n  totals: %d corrupt, %d silent" % (corrupt, silent))
 
     # A loss percentage is meaningless on its own: frames are polled at a few
-    # kHz while rows print at 250 Hz, so what matters is whether enough answers
-    # survive to fill a step, not what fraction was lost.
+    # kHz while rows print at ~250-670 Hz depending on the fitted part, so what
+    # matters is whether enough answers survive to fill a step, not what
+    # fraction was lost.
     worst = min(usable, key=lambda r: r["telem_ok"])
     answered_hz = worst["telem_ok"] / (hold_ms / 1000.0)
-    headroom = answered_hz / (1e6 / PRINT_FAST_US)
+    rows_s = rows_per_second(link)
+    headroom = answered_hz / rows_s
     print("  worst case %.0f answered frames/s at %d rpm, against %.0f rows/s"
-          % (answered_hz, worst["rpm_mean"], 1e6 / PRINT_FAST_US))
+          % (answered_hz, worst["rpm_mean"], rows_s))
     if headroom >= 5:
         print("  -> %.0fx more answers than rows printed. The loss costs no"
               % headroom)
@@ -2305,11 +2346,17 @@ def watch_idle(link, seconds, interval=5.0):
             print("    came back wrong, so a corrupt thrust sample is a corrupt READ,")
             print("    not a corrupt conversion.")
             # Naming what was already excluded by measurement, so nobody spends
-            # an evening re-excluding it.
-            print("    On this bench it is the supply: 0.018%% with the ESC")
-            print("    disconnected and no current flowing. Already ruled out by")
+            # an evening re-excluding it. Bench-specific: on the reference stand
+            # the fault was measured (2026-09-01) at ~0.018% with the ESC
+            # disconnected, then removed by the 2026-09-02 rewire with the
+            # mechanism never identified -- treat "it is the supply" as that
+            # bench's history, not a law. See BENCH_NOTES.md.
+            print("    On the reference bench this was the supply: 0.018%% with the")
+            print("    ESC disconnected and no current flowing. Ruled out there by")
             print("    measurement -- bus speed, the DRDY pin, the DShot signal wire,")
-            print("    and pull-ups. Suspect common-mode coupling from the supply.")
+            print("    and pull-ups -- then removed by a rewire with the mechanism")
+            print("    unidentified (2026-09-02). Suspect common-mode coupling, but")
+            print("    re-measure rather than assuming this bench is the same.")
         else:
             print("\n    No mangled transfers. Weaker evidence than a hit would be --")
             print("    the ADC read is 3 bytes to this one, so it is more exposed per")
@@ -3938,7 +3985,7 @@ def main():
     if mode == "LINKTEST":
         check_rotation_sign(rows, rotation)
         write_csv(args.output, rows, fields, link, mode, args.notes, extra_meta)
-        report_link_test(rows, args.hold_ms)
+        report_link_test(link, rows, args.hold_ms)
         return
 
     if mode == "FINEWALK":
