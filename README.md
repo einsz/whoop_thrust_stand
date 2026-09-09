@@ -527,6 +527,11 @@ commanded step levels, so a reader can pick step edges exactly rather than
 inferring them from sample counts. A file can then be interpreted without any
 accompanying document.
 
+Per-sample files also carry a `phase` column: which part of the sequence each
+row belongs to, as a code the `# phase,` header names. On a `RESPONSE` run it
+separates the steps from the staircase down to zero that follows them, which is
+the tail that used to leak into fall times.
+
 `# setup,specimen=<id>` is the only place that says which physical prop was
 mounted, and it is optional in every mode. A run without it is normal, not
 an error. Assign it after the fact by adding `specimen:` to the run's own

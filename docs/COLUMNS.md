@@ -204,10 +204,18 @@ with the throttles and repeat count actually commanded (`--base`/`--high`/
 inferred from sample counts, which is how the firmware's ~400 ms spindown tail
 leaked into fall-time figures.
 
+Every row also carries `phase`, the firmware's own label for the part of the
+sequence the row belongs to, decoded by the `# phase,` line in the header. On a
+`RESPONSE` file that separates the steps (`5=response`) from the staircase down
+to zero that follows them (`8=spindown`), so a consumer selects the rows it
+wants instead of inferring them. Files written before the column existed do not
+carry it, and the header pair above stays the fallback for those.
+
 | column | meaning |
 |---|---|
 | `mode` | `transient`, `response` or `coastdown` |
 | `time_s` | seconds since the first logged row |
+| `phase` | which part of the sequence this row belongs to, as a code the `# phase,` header names |
 | `throttle_pct` | commanded throttle in percent |
 | `dshot` | raw DShot setpoint |
 | `rpm` | mechanical RPM this row |

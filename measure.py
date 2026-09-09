@@ -858,7 +858,16 @@ KV_FIELDS = [
 ]
 
 TRANSIENT_FIELDS = [
-    "mode", "time_s", "throttle_pct", "dshot",
+    # phase is the firmware's own label for what the sequence was doing when
+    # the row was printed, decoded by the #PHASE dictionary in the banner. The
+    # rows always carried it and this list dropped it, which left every
+    # consumer inferring the step sequence from throttle values alone. That
+    # inference is wrong in a specific way: a RESPONSE file does not end at the
+    # last step, it walks the throttle down a staircase to zero, and the final
+    # tail segment is long enough to pass a sample-count filter and be averaged
+    # in as a fall edge. Writing the label out lets a reader select the phase
+    # instead of guessing at it. Added column, so still schema 1.
+    "mode", "time_s", "phase", "throttle_pct", "dshot",
     "rpm", "erpm", "erpm_raw", "new_rpm",
     "thrust_g", "thrust_raw", "new_thrust", "thrust_age_us", "thrust_t_s",
     "volts", "amps", "shunt_uv", "new_ina", "ina_age_us",
@@ -1240,6 +1249,8 @@ def collect_samples(link, command, start_prefix, end_token, mode):
         logs.append({
             "mode": mode,
             "time_s": round((row["t_us"] - t0) / 1e6, 6),
+            # Absent on firmware predating the column, like erpm_raw below.
+            "phase": row.get("phase", ""),
             "throttle_pct": row["throttle_pct"],
             "dshot": row["dshot"],
             "rpm": row["rpm"],
