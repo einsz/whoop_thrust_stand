@@ -54,10 +54,13 @@ def hold(link, dshot, settle_ms=1200, log_ms=1500):
     link.write_line("DHOLD,%d,%d,%d" % (dshot, log_ms, settle_ms))
     acc = measure.Accumulator()
     recording = False
+    quiet = measure.SilenceTimer("END_HOLD")
     while True:
         line = link.readline()
         if not line:
+            quiet.check()
             continue
+        quiet.feed()
         if line.startswith("#"):
             link.absorb_meta(line)
             continue
@@ -126,7 +129,9 @@ def main():
         cfg = measure.load_stand_config()
         link.scale = cfg.get("hx711_scale")
         link.start_keepalive()
-        print("--> %s   scale %.4f" % (link.meta.get("fw", ["?"])[0], link.scale))
+        print("--> %s   scale %s"
+              % (link.meta.get("fw", ["?"])[0],
+                 "%.4f" % link.scale if link.scale else "none"))
         print("--> bus %.3f V" % measure.require_bus_power(link))
 
         if args.settle_first:
@@ -140,11 +145,19 @@ def main():
               % ("phase", "t_s", "period", "rpm", "thrust", "volts", "watts",
                  "n_codes", "vs first"))
         ref = None
+        stalled = False
         for i in range(args.holds):
             tare(link)
             s = hold(link, args.dshot)
             if ref is None:
                 ref = s
+                if ref["rpm_mean"] < 1000:
+                    print("\n  *** NO START: the first hold read %d rpm at dshot %d."
+                          % (ref["rpm_mean"], args.dshot))
+                    print("      A motor that will not turn must not be driven")
+                    print("      further -- check the ESC, the rail and the prop.")
+                    stalled = True
+                    break
             show("soak %d" % (i + 1), t0, s, None if s is ref else ref)
 
             # A stalled motor at full commanded throttle is the one state that
@@ -158,6 +171,7 @@ def main():
                 print("\n  *** STALL: %d rpm against %d on the first hold. Stopping"
                       % (s["rpm_mean"], ref["rpm_mean"]))
                 print("      the soak. Check the motor and prop before running again.")
+                stalled = True
                 break
             if drop >= args.abort_drop_pct:
                 print("\n  *** decay reached -%.2f%% (limit %.2f%%). Soak phase ends"
@@ -165,21 +179,30 @@ def main():
                 print("      here; the rest phase still runs, to measure recovery.")
                 break
 
-        for rest in rests:
-            print("\n  resting %d s (motor stopped)..." % rest)
-            link.write_line("0")
-            time.sleep(rest)
-            tare(link)
-            s = hold(link, args.dshot)
-            show("rest %ds" % rest, t0, s, ref)
+        # The rest phase exists to measure recovery from DECAY. After a stall it
+        # would re-command the stalled motor at full throttle -- the exact state
+        # the stall check exists to end -- so it must not run then.
+        if not stalled:
+            for rest in rests:
+                print("\n  resting %d s (motor stopped)..." % rest)
+                link.write_line("0")
+                time.sleep(rest)
+                tare(link)
+                s = hold(link, args.dshot)
+                show("rest %ds" % rest, t0, s, ref)
 
-        print("\nIf the period climbed through the soak while thrust held up, the")
-        print("rotor did not slow and the telemetry drifted. If thrust fell by the")
-        print("n^2 amount, the motor really was slowing and this is not a telemetry")
-        print("fault at all.")
+            print("\nIf the period climbed through the soak while thrust held up, the")
+            print("rotor did not slow and the telemetry drifted. If thrust fell by the")
+            print("n^2 amount, the motor really was slowing and this is not a telemetry")
+            print("fault at all.")
+        else:
+            print("\nNot running the rest phase: a stall is not a decay, and its")
+            print("holds would drive the stalled motor again. Check the motor and")
+            print("prop before running this tool again.")
 
     except Exception as exc:
         print("\n[ERROR] %s" % exc, file=sys.stderr)
+        sys.exit(1)
     finally:
         print("\nSafety: commanding motor stop.")
         if link is not None:

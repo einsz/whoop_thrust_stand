@@ -45,10 +45,13 @@ def hold(link, target, settle_ms=1200, log_ms=1500):
     link.write_line("DHOLD,%d,%d,%d" % (target, log_ms, settle_ms))
     acc = measure.Accumulator()
     recording = False
+    quiet = measure.SilenceTimer("END_HOLD")
     while True:
         line = link.readline()
         if not line:
+            quiet.check()
             continue
+        quiet.feed()
         if line.startswith("#"):
             link.absorb_meta(line)
             continue
@@ -140,13 +143,21 @@ def main():
             pb = statistics.mean(x[0] for x in b)
             wa = statistics.mean(x[2] * x[3] for x in a)
             wb = statistics.mean(x[2] * x[3] for x in b)
-            print("%-7d %-14.2f %-14.2f %-10.2f %.2f%%"
-                  % (target, pa, pb, pb - pa, 100.0 * (wb - wa) / wa))
+            if wa:
+                delta = "%.2f%%" % (100.0 * (wb - wa) / wa)
+            else:
+                # A motor that never started draws ~no power, and dividing by a
+                # zero mean would crash the delta table that says why nothing
+                # moved. Say so instead.
+                delta = "n/a (no power drawn above)"
+            print("%-7d %-14.2f %-14.2f %-10.2f %s"
+                  % (target, pa, pb, pb - pa, delta))
         print("\nA positive delta with power unchanged is the dead zone: same")
         print("operating point, different reported period, selected by history.")
 
     except Exception as exc:
         print("\n[ERROR] %s" % exc, file=sys.stderr)
+        sys.exit(1)
     finally:
         print("\nSafety: commanding motor stop.")
         if link is not None:

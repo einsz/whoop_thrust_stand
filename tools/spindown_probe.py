@@ -10,6 +10,7 @@ energy back.
 """
 import argparse
 import importlib.util
+import os
 import sys
 import time
 
@@ -33,10 +34,12 @@ def main():
     ap.add_argument("--log-ms", type=int, default=500)
     ap.add_argument("--settle-ms", type=int, default=1500)
     ap.add_argument("--no-psu", action="store_true")
+    ap.add_argument("-p", "--port", default="/dev/ttyACM0")
+    ap.add_argument("--psu-port", default="/dev/ttyUSB0", metavar="DEV")
     args = ap.parse_args()
 
     measure = load(MEASURE, "measure")
-    link = measure.Link("/dev/ttyACM0", measure.BAUD_RATE)
+    link = measure.Link(args.port, measure.BAUD_RATE)
     link.write_line("ID")
     deadline = time.time() + 3.0
     while time.time() < deadline and link.cols is None:
@@ -49,18 +52,21 @@ def main():
     psu = None
     if not args.no_psu:
         psu_mod = load(PSU_PY, "psu")
-        psu = psu_mod.PSU("/dev/ttyUSB0")
+        psu = psu_mod.PSU(args.psu_port)
         psu.set_voltage(args.volts)
         print("supply settled at %.3f V" % psu.settle(args.volts))
 
     link.start_keepalive()
     rows, recording = [], False
+    quiet = measure.SilenceTimer("END_HOLD")
     try:
         link.write_line("DHOLD,%d,%d,%d" % (args.dshot, args.log_ms, args.settle_ms))
         while True:
             line = link.readline()
             if not line:
+                quiet.check()
                 continue
+            quiet.feed()
             if line.startswith("#"):
                 link.absorb_meta(line)
                 continue

@@ -99,6 +99,13 @@ def main():
                     help="filename prefix; defaults to phase-<UTC timestamp>")
     ap.add_argument("--outdir", default=os.path.join(ROOT, "data"))
     args = ap.parse_args()
+    if args.log_ms > 10000:
+        # The firmware clamps the logged window to 10 s (runHoldSequence), so a
+        # longer ask would silently become a shorter run -- refuse up front, the
+        # way tone_hold.py does.
+        sys.exit("--log-ms %d exceeds the firmware cap of 10000 ms; the board "
+                 "would clamp it and the run would be shorter than asked."
+                 % args.log_ms)
 
     measure = load(os.path.join(ROOT, "measure.py"), "measure")
     scopemod = load(os.path.join(ROOT, "tools", "scope.py"), "scope")
@@ -191,10 +198,16 @@ def main():
         recording = False
         worker = None
         last_n_rpm = None
+        # Bounded like every other motor-driving harvest: a board that stalls
+        # without printing END_HOLD must end the run, not hang it with the
+        # watchdog fed and the motor held.
+        quiet = measure.SilenceTimer("END_HOLD")
         while True:
             line = link.readline()
             if not line:
+                quiet.check()
                 continue
+            quiet.feed()
             if line.startswith("#"):
                 link.absorb_meta(line)
                 continue

@@ -229,6 +229,16 @@ def cmd_set(args):
     fw = FourWay(args.port)
     fw.init_flash()
     current = fw.read_block(EEPROM_ADDR, EEPROM_LEN)
+    # The field offsets below are layout-4 ones. show() warns on any other
+    # layout; here a wrong offset would not merely print wrong names -- the
+    # page would be erased and rewritten with every field in the wrong byte,
+    # and the verify would pass because it compares against the bytes just
+    # written. Refuse before erasing anything.
+    if current[1] != 4:
+        sys.exit("refusing to write: the settings page is layout v%d and this "
+                 "tool decodes layout 4. Read it with --raw first and only set "
+                 "fields you have checked against the v4 layout."
+                 % current[1])
     new = bytearray(current)
     for item in args.assignments:
         name, sep, value = item.partition("=")
@@ -236,7 +246,16 @@ def cmd_set(args):
             sys.exit("expected NAME=VALUE with NAME one of: %s"
                      % ", ".join(sorted(BY_NAME)))
         index = BY_NAME[name]
-        new[index] = int(value) & 0xFF
+        try:
+            parsed = int(value)
+        except ValueError:
+            sys.exit("value for %s must be an integer, not %r" % (name, value))
+        # A byte is 0..255; a silent & 0xFF would turn motor_kv=-1 into 255
+        # and write a field that looks plausible but is not what was asked.
+        if not 0 <= parsed <= 255:
+            sys.exit("value %d for %s is outside 0..255 and would be truncated"
+                     % (parsed, name))
+        new[index] = parsed
         print("  %-26s [%3d] %3d -> %3d" % (name, index, current[index], new[index]))
     if new == current:
         print("nothing to do")

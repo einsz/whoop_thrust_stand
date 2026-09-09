@@ -5,7 +5,7 @@ repository root are the stand; these are the instruments around it, the
 emulator that lets you work without it, and the one-off experiments that
 answered specific questions about the hardware.
 
-They fall into four groups:
+They fall into six groups:
 
 | tool | group | what it is for |
 |---|---|---|
@@ -21,6 +21,7 @@ They fall into four groups:
 | [`approach_test.py`](#approach_testpy) | experiment | does the direction of approach change the reported speed |
 | [`spindown_probe.py`](#spindown_probepy) | experiment | what the rail does while the motor gives its energy back, to tune the ramp rate |
 | [`bus_check.py`](#bus_checkpy) | analysis | count I2C transfers the bus mangled, live or in a saved run |
+| [`block_compare.py`](#block_comparepy) | analysis | one block of repeated sweeps against another: block means, spread and step-feature deviation |
 | [`branch_probe.py`](#branch_probepy) | experiment | provoke and detect the half-speed branch, the open drive defect |
 | [`sweep_monotonic.py`](#sweep_monotonicpy) | analysis | flag sweeps where RPM falls as throttle rises, before their numbers get used |
 | [`patch_bluejay_debug.py`](#patch_bluejay_debugpy) | ESC | patch a released Bluejay hex to stream its internal commutation period |
@@ -426,7 +427,8 @@ python tools/spindown_probe.py --volts 3.5 --dshot 2000
 
 Reports the peak the rail reaches while the motor gives its energy back, and
 the headroom to the 8 V OVP the ramp exists to avoid. `--no-psu` skips the
-supply, for a battery-run stop.
+supply, for a battery-run stop. As with every other serial tool, `-p/--port`
+chooses the stand and `--psu-port` the supply.
 
 ---
 
@@ -434,10 +436,12 @@ supply, for a battery-run stop.
 
 ### `bus_check.py`
 
-Counts I2C transfers the bus mangled. This stand's bus is corrupted whenever the
-bench supply is switched on: about one transfer in a thousand, at zero load,
-with the ESC disconnected and no current flowing. This tool is how that was
-measured and how any fix gets scored.
+Counts I2C transfers the bus mangled. On this stand the bus corrupted whenever
+the bench supply was switched on -- about one transfer in a thousand, at zero
+load, with the ESC disconnected and no current flowing. That was measured in
+2026-09-01 and removed by the 2026-09-02 rewire, with the mechanism never
+identified, so treat it as that bench's history rather than a live fault. This
+tool is how that was measured and how any fix gets scored.
 
 ```bash
 python tools/bus_check.py --seconds 300              # one window, motor stopped, rail ON
@@ -583,8 +587,11 @@ shipped image is not downloadable if it predates the public releases.
 
 **The settings page has layout versions and is not self-describing.** Byte 1
 says which, and this tool decodes version 4, from AM32 2.21's `Inc/eeprom.h`.
-On anything else read `--raw` and check the field names against the firmware
-you flashed rather than trusting the labels.
+`show` warns on any other layout, and `set` refuses -- before erasing anything
+-- because writing version-4 field offsets onto a version-1/2/3 page would put
+every value in the wrong byte and the verify would still pass. On anything else
+read `--raw` and check the field names against the firmware you flashed rather
+than trusting the labels.
 
 **Check every field after a firmware update.** AM32 2.21 migrates an older page
 in `loadEEpromSettings`, and that migration is incomplete: it clears the bytes
