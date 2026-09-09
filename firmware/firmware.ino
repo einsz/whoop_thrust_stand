@@ -329,6 +329,13 @@ volatile bool     core0StallLatched = false;
 // and the rows collected so far, rather than blocking forever waiting for one.
 volatile bool     sequenceAbort    = false;
 
+// Core 0 asking core 1 to zero the telemetry counters at the start of a
+// sequence. The counters are incremented by core 1's telemetry decode in
+// loop1, so core 0 zeroing them directly could land between core 1's load and
+// store and leak the previous sequence's counts into the new run's #STATS.
+// Core 1 does the zeroing itself when it next sees this flag.
+volatile bool     sequenceResetPending = false;
+
 // --- Core 0 sensor state ---
 long     thrustRaw         = 0;
 uint32_t thrustSeq         = 0;
@@ -552,14 +559,12 @@ void emitSample(uint8_t phase) {
 // escMaxStress and escAlertCount were previously never cleared, so #STATS
 // reported a since-boot maximum while claiming to report the sequence's.
 void resetSequenceCounters() {
-  telemOkCount = 0;
-  telemBadCount = 0;
-  telemCorruptCount = 0;
-  telemSilentCount = 0;
-  edtFrameCount = 0;
-  escMaxStress = 0;
-  escAlertCount = 0;
-  escAlertPending = false;
+  // The telemetry counters below are core 1's: loop1() increments them as
+  // frames arrive. Zeroing them here on core 0 is a read-modify-write race --
+  // core 1's load/add/store can straddle the zero and resurrect the previous
+  // sequence's counts into the new run's #STATS. Flag instead, and let loop1()
+  // do the zeroing; this function keeps only what core 0 owns.
+  sequenceResetPending = true;
   rowsDropped = 0;
   // A trip belongs to the run it happened in. watchdogTripped is otherwise
   // cleared only by a bare throttle number or DSHOT, so one trip flagged every
@@ -849,11 +854,18 @@ void runWindow(uint32_t durationUs, uint8_t phase, uint32_t logAfterUs);
 void rampThrottleDown() {
   int value = (int)currentDshotValue;
   while (value > 0) {
+    // STOP and the watchdog are immediate by design: whoever asked has already
+    // zeroed the shared setpoint, so the ramp's local copy must not keep
+    // commanding it back up for the rest of the step sequence.
+    if (abortRequested()) break;
     value -= SPINDOWN_STEP_DSHOT;
     if (value < 0) value = 0;
     setThrottleRaw(value);
     runWindow((uint32_t)SPINDOWN_STEP_MS * 1000UL, PHASE_SPINDOWN, 0);
   }
+  // On an abort the throttle is already at zero, so the coast tail would only
+  // delay the run's end for a stop nobody asked to be measured. Skip it.
+  if (abortRequested()) return;
   setThrottle(0);
   runWindow((uint32_t)SPINDOWN_TAIL_MS * 1000UL, PHASE_SPINDOWN, 0);
 }
@@ -1181,9 +1193,10 @@ void loop() {
 // Sequence helper: run sensors + logging for a fixed window
 // =========================================================================
 // Returns early once an abort is requested, so a sequence stops at the next
-// sample rather than at the end of the current step. The spin-down is exempt:
-// rampThrottleDown() runs on this same path and is the safe stop itself, so
-// aborting it would leave the throttle wherever the ramp had reached.
+// sample rather than at the end of the current step. The spin-down windows are
+// exempt: they belong to rampThrottleDown(), which checks the abort between
+// steps -- a window that aborted mid-step would leave the throttle wherever the
+// ramp had reached until the next one started anyway.
 void runWindow(uint32_t durationUs, uint8_t phase, uint32_t logAfterUs) {
   uint32_t windowStart = micros();
   uint32_t lastLog = 0;
@@ -1234,9 +1247,13 @@ void sequenceDelay(uint32_t ms) {
 //
 // The spin-down ramp is skipped on abort: an abort has already set the throttle
 // to zero, deliberately and immediately, and ramping from zero does nothing.
+// Re-sample after the ramp too: a STOP or watchdog trip that lands mid-ramp is
+// honoured by rampThrottleDown() (it breaks out of the ramp) and must be
+// reported here rather than swallowed as a normal sequence end.
 void endSequence(const char *statsTag, const __FlashStringHelper *sentinel) {
   bool aborted = abortRequested();
   if (!aborted) rampThrottleDown();
+  aborted = abortRequested();
   setThrottle(0);
   if (aborted) {
     // The three are worth telling apart in a CSV: a stall means the board needs
@@ -1276,6 +1293,10 @@ void runSweepSequence() {
     bool stable = true;
     for (int check = 0; check < 10; check++) {
       sequenceDelay(10);
+      // An abort mid-hunt must not let the checks declare "stable" while the
+      // rotor is still coasting above the threshold: that would re-enter
+      // Phase B and re-command a throttle after the stop was asked for.
+      if (abortRequested()) { stable = false; break; }
       if (rpmFromErpm(erpmFromRaw(currentErpmRaw)) < 2500) { stable = false; break; }
     }
     if (stable) {
@@ -1297,7 +1318,7 @@ void runSweepSequence() {
   }
 
   // Phase B: 1% steps up
-  for (int t = reliableStartThrottle; t <= 100; t++) {
+  for (int t = reliableStartThrottle; t <= 100 && !abortRequested(); t++) {
     setThrottle(t);
     runWindow(200000, PHASE_SWEEP, 100000);
     if (abortRequested()) break;
@@ -1495,6 +1516,20 @@ static inline bool core0Stalled() {
 }
 
 void loop1() {
+  // Telemetry counters are incremented on this core, so they are zeroed on this
+  // core: see sequenceResetPending and resetSequenceCounters(). Done ahead of
+  // the sends and the decode below so a new sequence's frames start at zero.
+  if (sequenceResetPending) {
+    telemOkCount = 0;
+    telemBadCount = 0;
+    telemCorruptCount = 0;
+    telemSilentCount = 0;
+    edtFrameCount = 0;
+    escMaxStress = 0;
+    escAlertCount = 0;
+    escAlertPending = false;
+    sequenceResetPending = false;
+  }
   // The stall override replaces only what is SENT. Telemetry is still decoded
   // below, on purpose: discarding it froze currentErpmRaw at its last value, so
   // a latched board reported the speed it had been doing when core 0 died and
